@@ -11,6 +11,9 @@ type Config struct {
 	BridgePort  int    // TCP bridge server port
 	AuthToken   string // Token for app authentication
 	BridgeToken string // Token for bridge authentication
+	TLSEnabled  bool   // Enable HTTPS
+	TLSCert     string // Path to TLS certificate
+	TLSKey      string // Path to TLS private key
 }
 
 // LoadConfig loads configuration from environment variables
@@ -40,6 +43,17 @@ func LoadConfig() *Config {
 
 	if bridgeToken := os.Getenv("BRIDGE_TOKEN"); bridgeToken != "" {
 		config.BridgeToken = bridgeToken
+	}
+
+	// TLS settings
+	if tlsEnabled := os.Getenv("TLS_ENABLED"); tlsEnabled == "true" || tlsEnabled == "1" {
+		config.TLSEnabled = true
+	}
+	if tlsCert := os.Getenv("TLS_CERT"); tlsCert != "" {
+		config.TLSCert = tlsCert
+	}
+	if tlsKey := os.Getenv("TLS_KEY"); tlsKey != "" {
+		config.TLSKey = tlsKey
 	}
 
 	return config

@@ -40,8 +40,13 @@ func (api *APIServer) StartHTTPServer() error {
 	mux.Handle("/api/", AuthMiddleware(api.config)(authMux))
 
 	addr := fmt.Sprintf(":%d", api.config.Port)
+	
+	if api.config.TLSEnabled && api.config.TLSCert != "" && api.config.TLSKey != "" {
+		log.Printf("HTTPS API Server listening on port %d (TLS enabled)", api.config.Port)
+		return http.ListenAndServeTLS(addr, api.config.TLSCert, api.config.TLSKey, mux)
+	}
+	
 	log.Printf("HTTP API Server listening on port %d", api.config.Port)
-
 	return http.ListenAndServe(addr, mux)
 }
 

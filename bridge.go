@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -39,12 +40,30 @@ func NewBridgeManager(config *Config) *BridgeManager {
 // StartTCPServer starts the TCP server for bridge connections
 func (bm *BridgeManager) StartTCPServer() error {
 	addr := fmt.Sprintf(":%d", bm.config.BridgePort)
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("failed to start TCP server: %v", err)
+	
+	var listener net.Listener
+	var err error
+	
+	if bm.config.TLSEnabled && bm.config.TLSCert != "" && bm.config.TLSKey != "" {
+		// TLS enabled
+		cert, err := tls.LoadX509KeyPair(bm.config.TLSCert, bm.config.TLSKey)
+		if err != nil {
+			return fmt.Errorf("failed to load TLS cert: %v", err)
+		}
+		tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
+		listener, err = tls.Listen("tcp", addr, tlsConfig)
+		if err != nil {
+			return fmt.Errorf("failed to start TLS TCP server: %v", err)
+		}
+		log.Printf("TCP Bridge Server listening on port %d (TLS enabled)", bm.config.BridgePort)
+	} else {
+		// Plain TCP
+		listener, err = net.Listen("tcp", addr)
+		if err != nil {
+			return fmt.Errorf("failed to start TCP server: %v", err)
+		}
+		log.Printf("TCP Bridge Server listening on port %d", bm.config.BridgePort)
 	}
-
-	log.Printf("TCP Bridge Server listening on port %d", bm.config.BridgePort)
 
 	// Start heartbeat checker
 	go bm.heartbeatChecker()
