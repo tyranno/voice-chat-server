@@ -1,0 +1,12 @@
+# Binaries
+voicechat-server
+voicechat-server.exe
+*.exe
+
+# Environment
+.env
+deploy/.env
+
+# IDE
+.idea/
+.vscode/

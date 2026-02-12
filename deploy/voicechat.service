@@ -1,0 +1,22 @@
+[Unit]
+Description=Voice Chat Server
+After=network.target
+
+[Service]
+Type=simple
+User=voicechat
+Group=voicechat
+WorkingDirectory=/opt/voicechat
+ExecStart=/opt/voicechat/voicechat-server
+Restart=always
+RestartSec=5
+EnvironmentFile=/opt/voicechat/.env
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/voicechat
+
+[Install]
+WantedBy=multi-user.target
