@@ -1,48 +1,48 @@
 package main
 
 import (
-	"io"
 	"log"
 	"net/http"
-	"net/url"
 
-	"golang.org/x/net/websocket"
+	"github.com/gorilla/websocket"
 )
 
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
 // STTProxy proxies WebSocket connections from the app to the local VOSK STT server.
-// App sends PCM audio binary frames, receives JSON text frames with recognition results.
 type STTProxy struct {
-	voskURL string // e.g. "ws://127.0.0.1:2700"
+	voskURL string
 }
 
 func NewSTTProxy(voskURL string) *STTProxy {
 	return &STTProxy{voskURL: voskURL}
 }
 
-// Handler returns an http.Handler for the WebSocket upgrade
 func (p *STTProxy) Handler() http.Handler {
-	return &websocket.Server{
-		Handler:   p.handleWS,
-		Handshake: func(config *websocket.Config, r *http.Request) error { return nil }, // Skip origin check
-	}
+	return http.HandlerFunc(p.handleHTTP)
 }
 
-func (p *STTProxy) handleWS(clientConn *websocket.Conn) {
-	clientConn.PayloadType = websocket.BinaryFrame
-	remoteAddr := clientConn.Request().RemoteAddr
+func (p *STTProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	// Upgrade client connection
+	clientConn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("[STT] Upgrade error: %v", err)
+		return
+	}
+	defer clientConn.Close()
+
+	remoteAddr := r.RemoteAddr
 	log.Printf("[STT] Client connected: %s", remoteAddr)
 
-	// Connect to local VOSK server
-	voskURL, _ := url.Parse(p.voskURL)
-	origin := "http://localhost/"
-	voskConn, err := websocket.Dial(voskURL.String(), "", origin)
+	// Connect to VOSK server
+	voskConn, _, err := websocket.DefaultDialer.Dial(p.voskURL, nil)
 	if err != nil {
 		log.Printf("[STT] Failed to connect to VOSK server: %v", err)
-		clientConn.Close()
 		return
 	}
 	defer voskConn.Close()
-	defer clientConn.Close()
 
 	log.Printf("[STT] Connected to VOSK server for client %s", remoteAddr)
 
@@ -50,19 +50,24 @@ func (p *STTProxy) handleWS(clientConn *websocket.Conn) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		buf := make([]byte, 8192)
 		for {
-			n, err := clientConn.Read(buf)
+			msgType, data, err := clientConn.ReadMessage()
 			if err != nil {
-				if err != io.EOF {
+				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 					log.Printf("[STT] Client read error: %v", err)
 				}
+				// Send EOF to VOSK before closing
+				voskConn.WriteMessage(websocket.TextMessage, []byte(`{"eof":1}`))
 				return
 			}
-			if n > 0 {
-				_, err = voskConn.Write(buf[:n])
-				if err != nil {
+			if msgType == websocket.BinaryMessage {
+				if err := voskConn.WriteMessage(websocket.BinaryMessage, data); err != nil {
 					log.Printf("[STT] VOSK write error: %v", err)
+					return
+				}
+			} else if msgType == websocket.TextMessage {
+				if err := voskConn.WriteMessage(websocket.TextMessage, data); err != nil {
+					log.Printf("[STT] VOSK write text error: %v", err)
 					return
 				}
 			}
@@ -71,23 +76,17 @@ func (p *STTProxy) handleWS(clientConn *websocket.Conn) {
 
 	// VOSK → Client (text results)
 	go func() {
-		voskConn.PayloadType = websocket.TextFrame
-		buf := make([]byte, 4096)
 		for {
-			n, err := voskConn.Read(buf)
+			_, data, err := voskConn.ReadMessage()
 			if err != nil {
-				if err != io.EOF {
+				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 					log.Printf("[STT] VOSK read error: %v", err)
 				}
 				return
 			}
-			if n > 0 {
-				clientConn.PayloadType = websocket.TextFrame
-				_, err = clientConn.Write(buf[:n])
-				if err != nil {
-					log.Printf("[STT] Client write error: %v", err)
-					return
-				}
+			if err := clientConn.WriteMessage(websocket.TextMessage, data); err != nil {
+				log.Printf("[STT] Client write error: %v", err)
+				return
 			}
 		}
 	}()
