@@ -159,6 +159,8 @@ func (bm *BridgeManager) bridgeMessageHandler(bridge *BridgeConnection) {
 		switch baseMsg.Type {
 		case MsgTypeHeartbeat:
 			bridge.LastPing = time.Now()
+			// Send heartbeat response so bridge's ReadDeadline doesn't expire
+			SendMessage(bridge.Conn, HeartbeatMessage{Type: MsgTypeHeartbeat})
 
 		case MsgTypeChatResponse:
 			var respMsg ChatResponseMessage

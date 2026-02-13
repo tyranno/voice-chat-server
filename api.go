@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
 	"time"
 )
 
@@ -14,20 +12,17 @@ import (
 type APIServer struct {
 	bridgeManager *BridgeManager
 	relayManager  *RelayManager
-	deviceStore   *DeviceStore
 	config        *Config
+	sttProxy      *STTProxy
 }
 
 // NewAPIServer creates a new API server
 func NewAPIServer(bridgeManager *BridgeManager, relayManager *RelayManager, config *Config) *APIServer {
-	// Ensure data dir exists
-	os.MkdirAll(config.DataDir, 0755)
-
 	return &APIServer{
 		bridgeManager: bridgeManager,
 		relayManager:  relayManager,
-		deviceStore:   NewDeviceStore(filepath.Join(config.DataDir, "devices.json")),
 		config:        config,
+		sttProxy:      NewSTTProxy("ws://127.0.0.1:2700"),
 	}
 }
 
@@ -35,17 +30,10 @@ func NewAPIServer(bridgeManager *BridgeManager, relayManager *RelayManager, conf
 func (api *APIServer) StartHTTPServer() error {
 	mux := http.NewServeMux()
 
-	// Public endpoints
-	mux.HandleFunc("/health", api.handleHealth)
-	mux.HandleFunc("/api/register", api.handleRegister)
-
-	// Protected endpoints (registered device token)
-	authMux := http.NewServeMux()
-	authMux.HandleFunc("/api/instances", api.handleInstances)
-	authMux.HandleFunc("/api/chat", api.handleChat)
-
-	// Apply device auth middleware
-	mux.Handle("/api/", api.deviceAuthMiddleware(authMux))
+	mux.HandleFunc("/health", api.cors(api.handleHealth))
+	mux.HandleFunc("/api/instances", api.cors(api.handleInstances))
+	mux.HandleFunc("/api/chat", api.cors(api.handleChat))
+	mux.Handle("/api/stt/stream", api.sttProxy.Handler())
 
 	addr := fmt.Sprintf(":%d", api.config.Port)
 
@@ -58,30 +46,18 @@ func (api *APIServer) StartHTTPServer() error {
 	return http.ListenAndServe(addr, mux)
 }
 
-// deviceAuthMiddleware validates registered device tokens
-func (api *APIServer) deviceAuthMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip register endpoint (handled separately)
-		if r.URL.Path == "/api/register" {
-			next.ServeHTTP(w, r)
+// cors wraps a handler with CORS headers
+func (api *APIServer) cors(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
 			return
 		}
-
-		token, err := ExtractBearerToken(r)
-		if err != nil {
-			http.Error(w, "missing token", http.StatusUnauthorized)
-			return
-		}
-
-		device := api.deviceStore.Validate(token)
-		if device == nil {
-			http.Error(w, "invalid token", http.StatusUnauthorized)
-			return
-		}
-
-		api.deviceStore.Touch(token)
-		next.ServeHTTP(w, r)
-	})
+		next(w, r)
+	}
 }
 
 // handleHealth handles health check requests
@@ -99,53 +75,6 @@ func (api *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
-}
-
-// handleRegister handles POST /api/register
-// Requires access code, returns device token
-func (api *APIServer) handleRegister(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		AccessCode string `json:"accessCode"`
-		DeviceName string `json:"deviceName"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	// Validate access code
-	if req.AccessCode != api.config.AccessCode {
-		log.Printf("[API] Registration failed: invalid access code from %s", r.RemoteAddr)
-		http.Error(w, "invalid access code", http.StatusForbidden)
-		return
-	}
-
-	if req.DeviceName == "" {
-		http.Error(w, "deviceName is required", http.StatusBadRequest)
-		return
-	}
-
-	// Register device
-	device, err := api.deviceStore.Register(req.DeviceName)
-	if err != nil {
-		log.Printf("[API] Registration error: %v", err)
-		http.Error(w, "registration failed", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"id":    device.ID,
-		"name":  device.Name,
-		"token": device.Token,
-	})
-
-	log.Printf("[API] Device registered: %s (%s) from %s", device.Name, device.ID, r.RemoteAddr)
 }
 
 // handleInstances handles GET /api/instances
@@ -187,8 +116,6 @@ func (api *APIServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
 	requestID := generateRequestID()
 	log.Printf("Starting chat relay: instance=%s, requestID=%s", chatReq.InstanceID, requestID)
@@ -217,7 +144,12 @@ func (api *APIServer) handleChat(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "data: %s\n\n", string(dataBytes))
 			flusher.Flush()
 
-		case err := <-errorCh:
+		case err, ok := <-errorCh:
+			if !ok || err == nil {
+				fmt.Fprintf(w, "data: [DONE]\n\n")
+				flusher.Flush()
+				return
+			}
 			errorData := map[string]string{"error": err.Error()}
 			dataBytes, _ := json.Marshal(errorData)
 			fmt.Fprintf(w, "data: %s\n\n", string(dataBytes))

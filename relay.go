@@ -24,6 +24,11 @@ func NewRelayManager(bridgeManager *BridgeManager, config *Config) *RelayManager
 func (rm *RelayManager) RelayChat(bridgeID, requestID string, messages []ChatMessage, responseCh chan<- string, errorCh chan<- error) {
 	defer close(responseCh)
 	defer close(errorCh)
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("RelayChat panic recovered: %v", r)
+		}
+	}()
 
 	// Get the bridge connection
 	bridge := rm.bridgeManager.GetBridge(bridgeID)
@@ -47,12 +52,14 @@ func (rm *RelayManager) RelayChat(bridgeID, requestID string, messages []ChatMes
 
 	for {
 		select {
-		case response := <-bridge.ResponseCh:
-			if response.RequestID != requestID {
-				continue // Skip responses for other requests
+		case response, ok := <-bridge.ResponseCh:
+			if !ok {
+				errorCh <- fmt.Errorf("bridge disconnected")
+				return
 			}
-
-			// Send delta to response channel
+			if response.RequestID != requestID {
+				continue
+			}
 			if response.Delta != "" {
 				select {
 				case responseCh <- response.Delta:
@@ -61,18 +68,19 @@ func (rm *RelayManager) RelayChat(bridgeID, requestID string, messages []ChatMes
 					return
 				}
 			}
-
-			// Check if this is the final response
 			if response.Done {
 				log.Printf("Chat request completed: %s", requestID)
 				return
 			}
 
-		case chatError := <-bridge.ErrorCh:
-			if chatError.RequestID != requestID {
-				continue // Skip errors for other requests
+		case chatError, ok := <-bridge.ErrorCh:
+			if !ok {
+				errorCh <- fmt.Errorf("bridge disconnected")
+				return
 			}
-
+			if chatError.RequestID != requestID {
+				continue
+			}
 			errorCh <- fmt.Errorf("chat error: %s", chatError.Error)
 			return
 

@@ -9,7 +9,6 @@ import (
 type Config struct {
 	Port        int    // HTTP server port
 	BridgePort  int    // TCP bridge server port
-	AccessCode  string // Code for app device registration
 	BridgeToken string // Token for bridge authentication
 	DataDir     string // Directory for persistent data (devices.json etc)
 	TLSEnabled  bool   // Enable HTTPS
@@ -22,7 +21,6 @@ func LoadConfig() *Config {
 	config := &Config{
 		Port:        8080,
 		BridgePort:  9090,
-		AccessCode:  "default-access-code",
 		BridgeToken: "default-bridge-token",
 		DataDir:     "/opt/voicechat/data",
 	}
@@ -37,10 +35,6 @@ func LoadConfig() *Config {
 		if p, err := strconv.Atoi(bridgePort); err == nil {
 			config.BridgePort = p
 		}
-	}
-
-	if accessCode := os.Getenv("ACCESS_CODE"); accessCode != "" {
-		config.AccessCode = accessCode
 	}
 
 	if dataDir := os.Getenv("DATA_DIR"); dataDir != "" {
