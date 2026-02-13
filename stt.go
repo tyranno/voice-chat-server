@@ -21,7 +21,10 @@ func NewSTTProxy(voskURL string) *STTProxy {
 
 // Handler returns an http.Handler for the WebSocket upgrade
 func (p *STTProxy) Handler() http.Handler {
-	return websocket.Handler(p.handleWS)
+	return &websocket.Server{
+		Handler:   p.handleWS,
+		Handshake: func(config *websocket.Config, r *http.Request) error { return nil }, // Skip origin check
+	}
 }
 
 func (p *STTProxy) handleWS(clientConn *websocket.Conn) {
