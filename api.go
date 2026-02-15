@@ -296,7 +296,12 @@ func (api *APIServer) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 	metaBytes, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(dir, "meta.json"), metaBytes, 0644)
 
-	downloadURL := fmt.Sprintf("/api/files/%s/%s", fileID, url.PathEscape(filename))
+	// Build full download URL
+	scheme := "https"
+	if r.TLS == nil && !strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		scheme = "http"
+	}
+	downloadURL := fmt.Sprintf("%s://%s/api/files/%s/%s", scheme, r.Host, fileID, url.PathEscape(filename))
 
 	log.Printf("File uploaded: id=%s, name=%s, size=%d", fileID, filename, written)
 
