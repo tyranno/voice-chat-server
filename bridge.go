@@ -10,6 +10,13 @@ import (
 	"time"
 )
 
+// RequestChannels holds per-request channels to avoid fan-out bugs
+type RequestChannels struct {
+	ResponseCh chan ChatResponseMessage
+	ErrorCh    chan ChatErrorMessage
+	FileCh     chan FileResponseMessage
+}
+
 // BridgeConnection represents a connected bridge client
 type BridgeConnection struct {
 	ID          string    `json:"id"`
@@ -18,8 +25,36 @@ type BridgeConnection struct {
 	ConnectedAt time.Time `json:"connectedAt"`
 	Conn        net.Conn  `json:"-"`
 	LastPing    time.Time `json:"-"`
-	ResponseCh  chan ChatResponseMessage `json:"-"`
-	ErrorCh     chan ChatErrorMessage    `json:"-"`
+	// Per-request channel registry (replaces shared channels)
+	requestChans map[string]*RequestChannels `json:"-"`
+	requestMu    sync.RWMutex               `json:"-"`
+}
+
+// RegisterRequest creates per-request channels
+func (bc *BridgeConnection) RegisterRequest(requestID string) *RequestChannels {
+	ch := &RequestChannels{
+		ResponseCh: make(chan ChatResponseMessage, 50),
+		ErrorCh:    make(chan ChatErrorMessage, 10),
+		FileCh:     make(chan FileResponseMessage, 10),
+	}
+	bc.requestMu.Lock()
+	bc.requestChans[requestID] = ch
+	bc.requestMu.Unlock()
+	return ch
+}
+
+// UnregisterRequest removes per-request channels
+func (bc *BridgeConnection) UnregisterRequest(requestID string) {
+	bc.requestMu.Lock()
+	delete(bc.requestChans, requestID)
+	bc.requestMu.Unlock()
+}
+
+// GetRequestChannels returns channels for a specific request
+func (bc *BridgeConnection) GetRequestChannels(requestID string) *RequestChannels {
+	bc.requestMu.RLock()
+	defer bc.requestMu.RUnlock()
+	return bc.requestChans[requestID]
 }
 
 // BridgeManager manages all bridge connections
@@ -111,14 +146,13 @@ func (bm *BridgeManager) handleBridgeConnection(conn net.Conn) {
 
 	// Create bridge connection
 	bridge := &BridgeConnection{
-		ID:          generateID(),
-		Name:        regMsg.Name,
-		Status:      "online",
-		ConnectedAt: time.Now(),
-		Conn:        conn,
-		LastPing:    time.Now(),
-		ResponseCh:  make(chan ChatResponseMessage, 100),
-		ErrorCh:     make(chan ChatErrorMessage, 100),
+		ID:           generateID(),
+		Name:         regMsg.Name,
+		Status:       "online",
+		ConnectedAt:  time.Now(),
+		Conn:         conn,
+		LastPing:     time.Now(),
+		requestChans: make(map[string]*RequestChannels),
 	}
 
 	// Register the bridge
@@ -168,10 +202,12 @@ func (bm *BridgeManager) bridgeMessageHandler(bridge *BridgeConnection) {
 				log.Printf("Failed to unmarshal chat response: %v", err)
 				continue
 			}
-			select {
-			case bridge.ResponseCh <- respMsg:
-			default:
-				log.Printf("Response channel full for bridge %s", bridge.ID)
+			if ch := bridge.GetRequestChannels(respMsg.RequestID); ch != nil {
+				select {
+				case ch.ResponseCh <- respMsg:
+				default:
+					log.Printf("Response channel full for request %s", respMsg.RequestID)
+				}
 			}
 
 		case MsgTypeChatError:
@@ -180,10 +216,24 @@ func (bm *BridgeManager) bridgeMessageHandler(bridge *BridgeConnection) {
 				log.Printf("Failed to unmarshal chat error: %v", err)
 				continue
 			}
-			select {
-			case bridge.ErrorCh <- errMsg:
-			default:
-				log.Printf("Error channel full for bridge %s", bridge.ID)
+			if ch := bridge.GetRequestChannels(errMsg.RequestID); ch != nil {
+				select {
+				case ch.ErrorCh <- errMsg:
+				default:
+				}
+			}
+
+		case MsgTypeFileResponse:
+			var fileMsg FileResponseMessage
+			if err := json.Unmarshal(data, &fileMsg); err != nil {
+				log.Printf("Failed to unmarshal file response: %v", err)
+				continue
+			}
+			if ch := bridge.GetRequestChannels(fileMsg.RequestID); ch != nil {
+				select {
+				case ch.FileCh <- fileMsg:
+				default:
+				}
 			}
 
 		default:
@@ -231,8 +281,15 @@ func (bm *BridgeManager) removeBridge(id string) {
 
 	if bridge, exists := bm.connections[id]; exists {
 		log.Printf("Bridge disconnected: %s (%s)", bridge.Name, bridge.ID)
-		close(bridge.ResponseCh)
-		close(bridge.ErrorCh)
+		// Close all per-request channels
+		bridge.requestMu.Lock()
+		for reqID, ch := range bridge.requestChans {
+			close(ch.ResponseCh)
+			close(ch.ErrorCh)
+			close(ch.FileCh)
+			delete(bridge.requestChans, reqID)
+		}
+		bridge.requestMu.Unlock()
 		delete(bm.connections, id)
 	}
 }
@@ -269,7 +326,7 @@ func (bm *BridgeManager) checkHeartbeats() {
 }
 
 // SendChatRequest sends a chat request to a specific bridge
-func (bm *BridgeManager) SendChatRequest(bridgeID, requestID string, messages []ChatMessage) error {
+func (bm *BridgeManager) SendChatRequest(bridgeID, requestID string, messages []ChatMessage, user string) error {
 	bridge := bm.GetBridge(bridgeID)
 	if bridge == nil {
 		return fmt.Errorf("bridge not found: %s", bridgeID)
@@ -279,6 +336,7 @@ func (bm *BridgeManager) SendChatRequest(bridgeID, requestID string, messages []
 		Type:      MsgTypeChatRequest,
 		RequestID: requestID,
 		Messages:  messages,
+		User:      user,
 	}
 
 	return SendMessage(bridge.Conn, chatReq)

@@ -14,6 +14,7 @@ const (
 	MsgTypeChatRequest  = "chat_request"
 	MsgTypeChatResponse = "chat_response"
 	MsgTypeChatError    = "chat_error"
+	MsgTypeFileResponse = "file_response"
 )
 
 // Base message structure
@@ -44,6 +45,7 @@ type ChatRequestMessage struct {
 	Type      string        `json:"type"`
 	RequestID string        `json:"requestId"`
 	Messages  []ChatMessage `json:"messages"`
+	User      string        `json:"user,omitempty"`
 }
 
 // Chat response from bridge to server
@@ -59,6 +61,16 @@ type ChatErrorMessage struct {
 	Type      string `json:"type"`
 	RequestID string `json:"requestId"`
 	Error     string `json:"error"`
+}
+
+// FileResponseMessage carries a file attachment from bridge to app
+type FileResponseMessage struct {
+	Type      string `json:"type"`
+	RequestID string `json:"requestId"`
+	Filename  string `json:"filename"`
+	URL       string `json:"url"`
+	Size      int64  `json:"size"`
+	MimeType  string `json:"mimeType,omitempty"`
 }
 
 // SendMessage sends a JSON message over TCP with 4-byte length header

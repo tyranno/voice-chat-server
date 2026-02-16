@@ -2,6 +2,8 @@ package main
 
 import (
 	"crypto/rand"
+	"bytes"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -22,6 +25,9 @@ type APIServer struct {
 	relayManager  *RelayManager
 	config        *Config
 	sttProxy      *STTProxy
+	convStore     *ConversationStore
+	notifHub      *NotificationHub
+	fcmManager    *FcmManager
 }
 
 // NewAPIServer creates a new API server
@@ -31,6 +37,9 @@ func NewAPIServer(bridgeManager *BridgeManager, relayManager *RelayManager, conf
 		relayManager:  relayManager,
 		config:        config,
 		sttProxy:      NewSTTProxy("ws://127.0.0.1:2700"),
+		convStore:     NewConversationStore(config.DataDir),
+		notifHub:      NewNotificationHub(),
+		fcmManager:    NewFcmManager(config.DataDir, config.FcmServiceAccount),
 	}
 }
 
@@ -43,10 +52,27 @@ func (api *APIServer) StartHTTPServer() error {
 	mux.HandleFunc("/api/chat", api.cors(api.handleChat))
 	mux.HandleFunc("/api/apk/latest", api.cors(api.handleApkLatest))
 	mux.HandleFunc("/api/apk/download", api.cors(api.handleApkDownload))
+	mux.HandleFunc("/api/apk/upload", api.cors(api.handleApkUpload))
+	mux.HandleFunc("/api/tts", api.cors(api.handleTTS))
 	mux.Handle("/api/stt/stream", api.sttProxy.Handler())
 	mux.HandleFunc("/api/files/upload", api.cors(api.handleFileUpload))
 	mux.HandleFunc("/api/files/list", api.cors(api.handleFileList))
 	mux.HandleFunc("/api/files/", api.cors(api.handleFileDownload))
+
+	// Conversation management
+	mux.HandleFunc("/api/conversations", api.cors(api.handleConversations))
+	mux.HandleFunc("/api/conversations/", api.cors(api.handleConversationAction))
+
+	// Notifications (WebSocket + REST)
+	mux.HandleFunc("/api/ws/notifications", api.notifHub.HandleWebSocket)
+	mux.HandleFunc("/api/notifications/send", api.cors(api.notifHub.HandleSendNotification))
+
+	// YouTube search proxy
+	mux.HandleFunc("/api/youtube/search", api.cors(api.handleYouTubeSearch))
+
+	// FCM push notifications
+	mux.HandleFunc("/api/fcm/register", api.cors(api.fcmManager.HandleRegister))
+	mux.HandleFunc("/api/fcm/send", api.cors(api.fcmManager.HandleSendPush))
 
 	addr := fmt.Sprintf(":%d", api.config.Port)
 
@@ -90,6 +116,108 @@ func (api *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// handleTTS proxies TTS requests to Google Cloud Text-to-Speech API
+func (api *APIServer) handleTTS(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if api.config.GoogleTTSAPIKey == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "TTS not configured"})
+		return
+	}
+
+	var req struct {
+		Text  string  `json:"text"`
+		Lang  string  `json:"lang"`
+		Voice string  `json:"voice"`
+		Rate  float64 `json:"rate"`
+	}
+
+	if r.Method == http.MethodGet {
+		// GET: read from query params
+		q := r.URL.Query()
+		req.Text = q.Get("text")
+		req.Lang = q.Get("lang")
+		req.Voice = q.Get("voice")
+		if rateStr := q.Get("rate"); rateStr != "" {
+			if v, err := strconv.ParseFloat(rateStr, 64); err == nil {
+				req.Rate = v
+			}
+		}
+	} else {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+	}
+
+	if req.Text == "" {
+		http.Error(w, "Missing text", http.StatusBadRequest)
+		return
+	}
+	if req.Lang == "" {
+		req.Lang = "ko-KR"
+	}
+	if req.Voice == "" {
+		req.Voice = "ko-KR-Neural2-A"
+	}
+	if req.Rate <= 0 || req.Rate > 4.0 {
+		req.Rate = 1.0
+	}
+
+	// Build Google TTS API request
+	gReq := map[string]interface{}{
+		"input": map[string]string{"text": req.Text},
+		"voice": map[string]string{"languageCode": req.Lang, "name": req.Voice},
+		"audioConfig": map[string]interface{}{
+			"audioEncoding": "MP3",
+			"speakingRate":  req.Rate,
+			"pitch":         0.0,
+		},
+	}
+	body, _ := json.Marshal(gReq)
+
+	apiURL := fmt.Sprintf("https://texttospeech.googleapis.com/v1/text:synthesize?key=%s", api.config.GoogleTTSAPIKey)
+	resp, err := http.Post(apiURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("[TTS] Google API error: %v", err)
+		http.Error(w, "TTS API error", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		log.Printf("[TTS] Google API HTTP %d: %s", resp.StatusCode, string(respBody))
+		http.Error(w, "TTS API error", http.StatusBadGateway)
+		return
+	}
+
+	var gResp struct {
+		AudioContent string `json:"audioContent"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&gResp); err != nil {
+		log.Printf("[TTS] Failed to decode response: %v", err)
+		http.Error(w, "TTS decode error", http.StatusInternalServerError)
+		return
+	}
+
+	audioBytes, err := base64.StdEncoding.DecodeString(gResp.AudioContent)
+	if err != nil {
+		log.Printf("[TTS] Failed to decode audio: %v", err)
+		http.Error(w, "Audio decode error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "audio/mpeg")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(audioBytes)))
+	w.Write(audioBytes)
+}
+
 // handleInstances handles GET /api/instances
 func (api *APIServer) handleInstances(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -131,12 +259,18 @@ func (api *APIServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 
 	requestID := generateRequestID()
-	log.Printf("Starting chat relay: instance=%s, requestID=%s", chatReq.InstanceID, requestID)
+	// Derive OpenClaw user from conversationId for session separation
+	user := "voicechat-app"
+	if chatReq.ConversationID != "" {
+		user = "vc-" + chatReq.ConversationID
+	}
+	log.Printf("Starting chat relay: instance=%s, requestID=%s, conversation=%s", chatReq.InstanceID, requestID, chatReq.ConversationID)
 
 	responseCh := make(chan string)
 	errorCh := make(chan error)
+	fileCh := make(chan FileResponseMessage, 100)
 
-	go api.relayManager.RelayChat(chatReq.InstanceID, requestID, chatReq.Messages, responseCh, errorCh)
+	go api.relayManager.RelayChat(chatReq.InstanceID, requestID, chatReq.Messages, user, responseCh, errorCh, fileCh)
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -144,13 +278,14 @@ func (api *APIServer) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for {
+	// Phase 1: Stream deltas
+	streaming := true
+	for streaming {
 		select {
 		case delta, ok := <-responseCh:
 			if !ok {
-				fmt.Fprintf(w, "data: [DONE]\n\n")
-				flusher.Flush()
-				return
+				streaming = false
+				continue
 			}
 			deltaData := map[string]string{"delta": delta}
 			dataBytes, _ := json.Marshal(deltaData)
@@ -159,16 +294,59 @@ func (api *APIServer) handleChat(w http.ResponseWriter, r *http.Request) {
 
 		case err, ok := <-errorCh:
 			if !ok || err == nil {
-				fmt.Fprintf(w, "data: [DONE]\n\n")
-				flusher.Flush()
-				return
+				streaming = false
+				continue
 			}
 			errorData := map[string]string{"error": err.Error()}
 			dataBytes, _ := json.Marshal(errorData)
 			fmt.Fprintf(w, "data: %s\n\n", string(dataBytes))
 			flusher.Flush()
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
 			return
 
+		case fileMsg := <-fileCh:
+			fileData := map[string]interface{}{
+				"file": map[string]interface{}{
+					"url":      fileMsg.URL,
+					"filename": fileMsg.Filename,
+					"size":     fileMsg.Size,
+				},
+			}
+			dataBytes, _ := json.Marshal(fileData)
+			fmt.Fprintf(w, "data: %s\n\n", string(dataBytes))
+			flusher.Flush()
+
+		case <-r.Context().Done():
+			return
+		}
+	}
+
+	// Phase 2: Drain file events after streaming completes
+	drainTimeout := time.NewTimer(30 * time.Second)
+	defer drainTimeout.Stop()
+	for {
+		select {
+		case fileMsg, ok := <-fileCh:
+			if !ok {
+				fmt.Fprintf(w, "data: [DONE]\n\n")
+				flusher.Flush()
+				return
+			}
+			fileData := map[string]interface{}{
+				"file": map[string]interface{}{
+					"url":      fileMsg.URL,
+					"filename": fileMsg.Filename,
+					"size":     fileMsg.Size,
+				},
+			}
+			dataBytes, _ := json.Marshal(fileData)
+			fmt.Fprintf(w, "data: %s\n\n", string(dataBytes))
+			flusher.Flush()
+		case <-drainTimeout.C:
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return
 		case <-r.Context().Done():
 			return
 		}
@@ -214,7 +392,7 @@ func (api *APIServer) handleApkLatest(w http.ResponseWriter, r *http.Request) {
 
 // handleApkDownload serves the APK file
 func (api *APIServer) handleApkDownload(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -228,6 +406,68 @@ func (api *APIServer) handleApkDownload(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "application/vnd.android.package-archive")
 	w.Header().Set("Content-Disposition", "attachment; filename=voicechat.apk")
 	http.ServeFile(w, r, apkPath)
+}
+
+// handleApkUpload handles POST /api/apk/upload
+func (api *APIServer) handleApkUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	const maxApkSize = 200 << 20 // 200MB
+	r.Body = http.MaxBytesReader(w, r.Body, maxApkSize)
+	if err := r.ParseMultipartForm(maxApkSize); err != nil {
+		http.Error(w, "File too large (max 200MB)", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	file, _, err := r.FormFile("apk")
+	if err != nil {
+		http.Error(w, "Missing 'apk' file field", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	version := r.FormValue("version")
+	versionCode := r.FormValue("versionCode")
+	if version == "" || versionCode == "" {
+		http.Error(w, "Missing 'version' or 'versionCode' form field", http.StatusBadRequest)
+		return
+	}
+
+	apkDir := filepath.Join(api.config.DataDir, "apk")
+	os.MkdirAll(apkDir, 0755)
+
+	apkPath := filepath.Join(apkDir, "app-debug.apk")
+	dst, err := os.Create(apkPath)
+	if err != nil {
+		http.Error(w, "Failed to save APK", http.StatusInternalServerError)
+		return
+	}
+	defer dst.Close()
+
+	written, err := io.Copy(dst, file)
+	if err != nil {
+		http.Error(w, "Failed to write APK", http.StatusInternalServerError)
+		return
+	}
+
+	vc, _ := strconv.Atoi(versionCode)
+	meta := map[string]interface{}{
+		"version":     version,
+		"versionCode": vc,
+		"updatedAt":   time.Now().UTC().Format(time.RFC3339),
+	}
+	metaBytes, _ := json.MarshalIndent(meta, "", "  ")
+	os.WriteFile(filepath.Join(apkDir, "version.json"), metaBytes, 0644)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":      true,
+		"size":    written,
+		"version": version,
+	})
 }
 
 const maxUploadSize = 50 << 20 // 50MB
@@ -395,4 +635,113 @@ func (api *APIServer) handleFileList(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(files)
+}
+
+// === Conversation API ===
+
+// handleConversations handles GET (list) and POST (create) on /api/conversations
+func (api *APIServer) handleConversations(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		convs, err := api.convStore.List()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(convs)
+
+	case http.MethodPost:
+		var req struct {
+			Title string `json:"title"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			req.Title = "새 대화"
+		}
+		if req.Title == "" {
+			req.Title = "새 대화"
+		}
+		id := fmt.Sprintf("%d", time.Now().UnixNano())
+		conv, err := api.convStore.Create(id, req.Title)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(conv)
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleConversationAction handles /api/conversations/:id and /api/conversations/:id/messages
+func (api *APIServer) handleConversationAction(w http.ResponseWriter, r *http.Request) {
+	// Parse path: /api/conversations/{id} or /api/conversations/{id}/messages
+	path := strings.TrimPrefix(r.URL.Path, "/api/conversations/")
+	parts := strings.SplitN(path, "/", 2)
+	if len(parts) == 0 || parts[0] == "" {
+		http.Error(w, "Missing conversation ID", http.StatusBadRequest)
+		return
+	}
+	convID := parts[0]
+	subPath := ""
+	if len(parts) > 1 {
+		subPath = parts[1]
+	}
+
+	switch {
+	case subPath == "messages" && r.Method == http.MethodGet:
+		// GET /api/conversations/:id/messages
+		msgs, err := api.convStore.GetMessages(convID)
+		if err != nil {
+			http.Error(w, "Conversation not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(msgs)
+
+	case subPath == "messages" && r.Method == http.MethodPut:
+		// PUT /api/conversations/:id/messages — replace all messages
+		var msgs []ConversationMessage
+		if err := json.NewDecoder(r.Body).Decode(&msgs); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if err := api.convStore.SetMessages(convID, msgs); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+
+	case subPath == "" && r.Method == http.MethodDelete:
+		// DELETE /api/conversations/:id
+		if err := api.convStore.Delete(convID); err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
+
+	case subPath == "" && r.Method == http.MethodPatch:
+		// PATCH /api/conversations/:id — update title
+		var req struct {
+			Title string `json:"title"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if err := api.convStore.UpdateTitle(convID, req.Title); err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+
+	default:
+		http.Error(w, "Not found", http.StatusNotFound)
+	}
 }

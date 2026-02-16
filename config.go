@@ -7,13 +7,15 @@ import (
 
 // Config holds the server configuration
 type Config struct {
-	Port        int    // HTTP server port
-	BridgePort  int    // TCP bridge server port
-	BridgeToken string // Token for bridge authentication
-	DataDir     string // Directory for persistent data (devices.json etc)
-	TLSEnabled  bool   // Enable HTTPS
-	TLSCert     string // Path to TLS certificate
-	TLSKey      string // Path to TLS private key
+	Port             int    // HTTP server port
+	BridgePort       int    // TCP bridge server port
+	BridgeToken      string // Token for bridge authentication
+	DataDir          string // Directory for persistent data (devices.json etc)
+	TLSEnabled       bool   // Enable HTTPS
+	TLSCert          string // Path to TLS certificate
+	TLSKey           string // Path to TLS private key
+	GoogleTTSAPIKey  string // Google Cloud TTS API key
+	FcmServiceAccount string // Firebase service account JSON path
 }
 
 // LoadConfig loads configuration from environment variables
@@ -54,6 +56,14 @@ func LoadConfig() *Config {
 	}
 	if tlsKey := os.Getenv("TLS_KEY"); tlsKey != "" {
 		config.TLSKey = tlsKey
+	}
+
+	if ttsKey := os.Getenv("GOOGLE_TTS_API_KEY"); ttsKey != "" {
+		config.GoogleTTSAPIKey = ttsKey
+	}
+
+	if fcmSA := os.Getenv("FCM_SERVICE_ACCOUNT"); fcmSA != "" {
+		config.FcmServiceAccount = fcmSA
 	}
 
 	return config
