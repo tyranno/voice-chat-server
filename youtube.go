@@ -1,12 +1,15 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"regexp"
+	"strings"
+	"time"
 )
 
 type YouTubeResult struct {
@@ -16,21 +19,21 @@ type YouTubeResult struct {
 }
 
 func (api *APIServer) handleYouTubeSearch(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", 405)
 		return
 	}
 
 	query := r.URL.Query().Get("q")
 	if query == "" {
-		http.Error(w, "Missing query parameter 'q'", http.StatusBadRequest)
+		http.Error(w, "Missing q parameter", 400)
 		return
 	}
 
 	results, err := searchYouTube(query)
 	if err != nil {
 		log.Printf("[YouTube] Search error: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Search failed: %v", err), 500)
 		return
 	}
 
@@ -39,100 +42,94 @@ func (api *APIServer) handleYouTubeSearch(w http.ResponseWriter, r *http.Request
 }
 
 func searchYouTube(query string) ([]YouTubeResult, error) {
-	// Use YouTube's internal API (youtubei)
-	apiURL := "https://www.youtube.com/youtubei/v1/search?prettyPrint=false"
+	searchURL := fmt.Sprintf("https://www.youtube.com/results?search_query=%s", url.QueryEscape(query))
 
-	payload := map[string]interface{}{
-		"context": map[string]interface{}{
-			"client": map[string]interface{}{
-				"clientName":    "WEB",
-				"clientVersion": "2.20240101.00.00",
-				"hl":            "ko",
-				"gl":            "KR",
-			},
-		},
-		"query": query,
-	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, _ := http.NewRequest("GET", searchURL, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept-Language", "ko-KR,ko;q=0.9,en;q=0.8")
 
-	body, _ := json.Marshal(payload)
-	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36")
-
-	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read failed: %w", err)
 	}
 
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("YouTube API returned %d", resp.StatusCode)
+	html := string(body)
+	return parseYouTubeResults(html)
+}
+
+func parseYouTubeResults(html string) ([]YouTubeResult, error) {
+	// Extract ytInitialData JSON from the HTML
+	re := regexp.MustCompile(`var ytInitialData\s*=\s*(\{.+?\});\s*</script>`)
+	match := re.FindStringSubmatch(html)
+	if match == nil {
+		re2 := regexp.MustCompile(`ytInitialData\s*=\s*'(\{.+?\})'`)
+		match = re2.FindStringSubmatch(html)
+	}
+	if match == nil {
+		return nil, fmt.Errorf("could not find ytInitialData")
 	}
 
-	// Parse the response to extract video results
-	var data map[string]interface{}
-	if err := json.Unmarshal(respBody, &data); err != nil {
-		return nil, fmt.Errorf("JSON parse error: %v", err)
-	}
+	jsonStr := match[1]
 
+	// Split by "videoRenderer" and extract videoId + title from each chunk
 	var results []YouTubeResult
-	extractVideos(data, &results)
+	seen := make(map[string]bool)
+
+	chunks := strings.Split(jsonStr, `"videoRenderer":{`)
+	for i := 1; i < len(chunks); i++ {
+		chunk := chunks[i]
+		// Extract videoId
+		vidRe := regexp.MustCompile(`"videoId":"([a-zA-Z0-9_-]{11})"`)
+		vidMatch := vidRe.FindStringSubmatch(chunk)
+		if vidMatch == nil {
+			continue
+		}
+		vid := vidMatch[1]
+		if seen[vid] {
+			continue
+		}
+		seen[vid] = true
+
+		// Extract title - look for "title":{"runs":[{"text":"..."}]}
+		title := "YouTube Video"
+		titleRe := regexp.MustCompile(`"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.)*)"\}`)
+		titleMatch := titleRe.FindStringSubmatch(chunk)
+		if titleMatch != nil {
+			title = unescapeJSON(titleMatch[1])
+		}
+
+		results = append(results, YouTubeResult{
+			VideoID:   vid,
+			Title:     title,
+			Thumbnail: fmt.Sprintf("https://i.ytimg.com/vi/%s/mqdefault.jpg", vid),
+		})
+
+		if len(results) >= 20 {
+			break
+		}
+	}
 
 	if len(results) == 0 {
-		return []YouTubeResult{}, nil
+		return nil, fmt.Errorf("no results found")
 	}
 
+	log.Printf("[YouTube] Found %d results for query", len(results))
 	return results, nil
 }
 
-func extractVideos(data interface{}, results *[]YouTubeResult) {
-	if len(*results) >= 20 {
-		return
-	}
-
-	switch v := data.(type) {
-	case map[string]interface{}:
-		// Check if this is a videoRenderer
-		if vr, ok := v["videoRenderer"].(map[string]interface{}); ok {
-			vid, _ := vr["videoId"].(string)
-			if vid != "" {
-				title := extractTitle(vr)
-				*results = append(*results, YouTubeResult{
-					VideoID:   vid,
-					Title:     title,
-					Thumbnail: fmt.Sprintf("https://i.ytimg.com/vi/%s/mqdefault.jpg", vid),
-				})
-			}
-			return
-		}
-		for _, val := range v {
-			extractVideos(val, results)
-		}
-	case []interface{}:
-		for _, item := range v {
-			extractVideos(item, results)
-		}
-	}
-}
-
-func extractTitle(vr map[string]interface{}) string {
-	if titleObj, ok := vr["title"].(map[string]interface{}); ok {
-		if runs, ok := titleObj["runs"].([]interface{}); ok && len(runs) > 0 {
-			if run, ok := runs[0].(map[string]interface{}); ok {
-				if text, ok := run["text"].(string); ok {
-					return text
-				}
-			}
-		}
-	}
-	return "제목 없음"
+func unescapeJSON(s string) string {
+	s = strings.ReplaceAll(s, `\"`, `"`)
+	s = strings.ReplaceAll(s, `\\`, `\`)
+	s = strings.ReplaceAll(s, `\u0026`, "&")
+	s = strings.ReplaceAll(s, `\u003c`, "<")
+	s = strings.ReplaceAll(s, `\u003e`, ">")
+	s = strings.ReplaceAll(s, `\u0027`, "'")
+	return s
 }
