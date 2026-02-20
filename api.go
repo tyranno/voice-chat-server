@@ -3,69 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
-
-	"golang.org/x/net/websocket"
 )
-
-// NotificationHub 알림 WebSocket 연결 관리
-type NotificationHub struct {
-	mu      sync.RWMutex
-	clients map[string]*websocket.Conn // instanceId → WebSocket conn
-}
-
-func NewNotificationHub() *NotificationHub {
-	return &NotificationHub{
-		clients: make(map[string]*websocket.Conn),
-	}
-}
-
-func (h *NotificationHub) Register(instanceID string, conn *websocket.Conn) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	// 기존 연결이 있으면 닫기
-	if old, ok := h.clients[instanceID]; ok {
-		old.Close()
-	}
-	h.clients[instanceID] = conn
-	log.Printf("[Notify] Client registered: %s", instanceID)
-}
-
-func (h *NotificationHub) Unregister(instanceID string, conn *websocket.Conn) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if existing, ok := h.clients[instanceID]; ok && existing == conn {
-		delete(h.clients, instanceID)
-		log.Printf("[Notify] Client unregistered: %s", instanceID)
-	}
-}
-
-// Send 알림을 특정 인스턴스에 전송 (instanceID 비어있으면 전체 브로드캐스트)
-func (h *NotificationHub) Send(instanceID string, payload []byte) int {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	sent := 0
-	if instanceID != "" {
-		if conn, ok := h.clients[instanceID]; ok {
-			if _, err := conn.Write(payload); err == nil {
-				sent++
-			}
-		}
-	} else {
-		for _, conn := range h.clients {
-			if _, err := conn.Write(payload); err == nil {
-				sent++
-			}
-		}
-	}
-	return sent
-}
 
 // APIServer handles HTTP API requests
 type APIServer struct {
@@ -73,19 +15,29 @@ type APIServer struct {
 	relayManager       *RelayManager
 	config             *Config
 	sttProxy           *STTProxy
-	notificationHub    *NotificationHub
+	notifyHub          *NotificationHub
+	fcmManager         *FcmManager
 	conversationStore  *ConversationStore
 	apkHandler         *APKHandler
 }
 
 // NewAPIServer creates a new API server
 func NewAPIServer(bridgeManager *BridgeManager, relayManager *RelayManager, config *Config) *APIServer {
+	// Initialize FCM manager
+	fcmSAPath := config.FcmServiceAccount
+	if fcmSAPath == "" {
+		// Default path
+		fcmSAPath = "/opt/voicechat/firebase-sa.json"
+	}
+	fcmMgr := NewFcmManager(config.DataDir, fcmSAPath)
+
 	return &APIServer{
 		bridgeManager:     bridgeManager,
 		relayManager:      relayManager,
 		config:            config,
 		sttProxy:          NewSTTProxy("ws://127.0.0.1:2700"),
-		notificationHub:   NewNotificationHub(),
+		notifyHub:         NewNotificationHub(),
+		fcmManager:        fcmMgr,
 		conversationStore: NewConversationStore(config.DataDir),
 		apkHandler:        NewAPKHandler(config.DataDir),
 	}
@@ -99,8 +51,10 @@ func (api *APIServer) StartHTTPServer() error {
 	mux.HandleFunc("/api/instances", api.cors(api.handleInstances))
 	mux.HandleFunc("/api/chat", api.cors(api.handleChat))
 	mux.HandleFunc("/api/stt/stream", api.sttProxy.Handler())
-	mux.Handle("/api/notifications/ws", websocket.Handler(api.handleNotificationWS))
+	mux.HandleFunc("/api/notifications/ws", api.notifyHub.HandleWebSocket)
 	mux.HandleFunc("/api/notify", api.cors(api.handleNotify))
+	mux.HandleFunc("/api/fcm/register", api.cors(api.fcmManager.HandleRegister))
+	mux.HandleFunc("/api/fcm/push", api.cors(api.fcmManager.HandleSendPush))
 	mux.HandleFunc("/api/conversations", api.cors(api.handleConversations))
 	mux.HandleFunc("/api/conversations/", api.cors(api.handleConversationByID))
 	mux.HandleFunc("/api/apk/latest", api.cors(api.apkHandler.HandleLatest))
@@ -195,8 +149,9 @@ func (api *APIServer) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	responseCh := make(chan string)
 	errorCh := make(chan error)
+	fileCh := make(chan FileResponseMessage, 8)
 
-	go api.relayManager.RelayChat(chatReq.InstanceID, requestID, chatReq.Messages, responseCh, errorCh)
+	go api.relayManager.RelayChat(chatReq.InstanceID, requestID, chatReq.Messages, "", responseCh, errorCh, fileCh)
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -235,47 +190,6 @@ func (api *APIServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleNotificationWS WebSocket 알림 연결 처리
-func (api *APIServer) handleNotificationWS(conn *websocket.Conn) {
-	remoteAddr := conn.Request().RemoteAddr
-
-	// 클라이언트가 첫 메시지로 instanceId를 보내야 함
-	var registerMsg struct {
-		InstanceID string `json:"instanceId"`
-	}
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	if err := websocket.JSON.Receive(conn, &registerMsg); err != nil || registerMsg.InstanceID == "" {
-		log.Printf("[Notify] Registration failed from %s: %v", remoteAddr, err)
-		conn.Close()
-		return
-	}
-	conn.SetReadDeadline(time.Time{}) // 타임아웃 해제
-
-	api.notificationHub.Register(registerMsg.InstanceID, conn)
-	defer api.notificationHub.Unregister(registerMsg.InstanceID, conn)
-
-	// ping/pong 루프 — 클라이언트가 ping 보내면 pong 응답
-	buf := make([]byte, 512)
-	for {
-		conn.SetReadDeadline(time.Now().Add(90 * time.Second))
-		n, err := conn.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("[Notify] Read error (%s): %v", registerMsg.InstanceID, err)
-			}
-			return
-		}
-		// ping 메시지 처리
-		if n > 0 {
-			var msg map[string]string
-			if json.Unmarshal(buf[:n], &msg) == nil && msg["type"] == "ping" {
-				pong, _ := json.Marshal(map[string]string{"type": "pong"})
-				conn.Write(pong)
-			}
-		}
-	}
-}
-
 // handleNotify POST /api/notify — Bridge(OpenClaw)가 알림 전송
 func (api *APIServer) handleNotify(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -299,20 +213,33 @@ func (api *APIServer) handleNotify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payload := map[string]string{
-		"type":   "notification",
-		"title":  req.Title,
-		"body":   req.Body,
-		"action": req.Action,
-	}
-	data, _ := json.Marshal(payload)
-	sent := api.notificationHub.Send(req.InstanceID, data)
+	// Send via WebSocket hub
+	api.notifyHub.SendTo(req.InstanceID, "info", req.Title, req.Body)
+	sent := api.notifyHub.ClientCount()
 
-	log.Printf("[Notify] Sent to %d clients (instanceId=%q, title=%q)", sent, req.InstanceID, req.Title)
+	log.Printf("[Notify] WebSocket sent (clients=%d, instanceId=%q, title=%q)", sent, req.InstanceID, req.Title)
+
+	// FCM fallback: if no WebSocket clients received the notification, try FCM push
+	fcmSent := 0
+	if sent == 0 && api.fcmManager != nil {
+		var fcmErr error
+		if req.InstanceID != "" {
+			fcmErr = api.fcmManager.SendPushTo(req.InstanceID, req.Title, req.Body)
+		} else {
+			fcmErr = api.fcmManager.SendPush(req.Title, req.Body)
+		}
+		if fcmErr != nil {
+			log.Printf("[Notify] FCM fallback failed: %v", fcmErr)
+		} else {
+			fcmSent = 1
+			log.Printf("[Notify] FCM fallback sent successfully")
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"sent": sent,
+		"sent":    sent,
+		"fcmSent": fcmSent,
 	})
 }
 
@@ -330,7 +257,11 @@ func (api *APIServer) handleConversations(w http.ResponseWriter, r *http.Request
 
 // handleListConversations handles GET /api/conversations
 func (api *APIServer) handleListConversations(w http.ResponseWriter, r *http.Request) {
-	conversations := api.conversationStore.ListConversations()
+	conversations, err := api.conversationStore.List()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(conversations)
 }
@@ -338,6 +269,7 @@ func (api *APIServer) handleListConversations(w http.ResponseWriter, r *http.Req
 // handleCreateConversation handles POST /api/conversations
 func (api *APIServer) handleCreateConversation(w http.ResponseWriter, r *http.Request) {
 	var req struct {
+		ID    string `json:"id"`
 		Title string `json:"title"`
 	}
 	
@@ -349,10 +281,13 @@ func (api *APIServer) handleCreateConversation(w http.ResponseWriter, r *http.Re
 	if req.Title == "" {
 		req.Title = "새 대화"
 	}
+	if req.ID == "" {
+		req.ID = fmt.Sprintf("%d", time.Now().UnixMilli())
+	}
 
-	conversation := api.conversationStore.CreateConversation(req.Title)
-	if conversation == nil {
-		http.Error(w, "Failed to create conversation", http.StatusInternalServerError)
+	conversation, err := api.conversationStore.Create(req.ID, req.Title)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -406,25 +341,25 @@ func (api *APIServer) handleConversationByID(w http.ResponseWriter, r *http.Requ
 
 // handleGetMessages handles GET /api/conversations/{id}/messages
 func (api *APIServer) handleGetMessages(w http.ResponseWriter, r *http.Request, conversationID string) {
-	conversation := api.conversationStore.GetConversation(conversationID)
-	if conversation == nil {
+	messages, err := api.conversationStore.GetMessages(conversationID)
+	if err != nil {
 		http.Error(w, "Conversation not found", http.StatusNotFound)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(conversation.Messages)
+	json.NewEncoder(w).Encode(messages)
 }
 
 // handleSaveMessages handles PUT /api/conversations/{id}/messages
 func (api *APIServer) handleSaveMessages(w http.ResponseWriter, r *http.Request, conversationID string) {
-	var messages []ConvMessage
+	var messages []ConversationMessage
 	if err := json.NewDecoder(r.Body).Decode(&messages); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 
-	if err := api.conversationStore.SaveMessages(conversationID, messages); err != nil {
+	if err := api.conversationStore.SetMessages(conversationID, messages); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -437,7 +372,7 @@ func (api *APIServer) handleSaveMessages(w http.ResponseWriter, r *http.Request,
 
 // handleDeleteConversation handles DELETE /api/conversations/{id}
 func (api *APIServer) handleDeleteConversation(w http.ResponseWriter, r *http.Request, conversationID string) {
-	if err := api.conversationStore.DeleteConversation(conversationID); err != nil {
+	if err := api.conversationStore.Delete(conversationID); err != nil {
 		http.Error(w, "Failed to delete conversation", http.StatusInternalServerError)
 		return
 	}
