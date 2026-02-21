@@ -1,13 +1,27 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
 	"time"
 )
+
+// NewLineScanner reads lines from a reader (for SSE parsing)
+type LineScanner struct {
+	scanner *bufio.Scanner
+}
+
+func NewLineScanner(r io.Reader) *LineScanner {
+	return &LineScanner{scanner: bufio.NewScanner(r)}
+}
+
+func (s *LineScanner) Scan() bool { return s.scanner.Scan() }
+func (s *LineScanner) Text() string { return s.scanner.Text() }
 
 // APIServer handles HTTP API requests
 type APIServer struct {
@@ -47,6 +61,7 @@ func NewAPIServer(bridgeManager *BridgeManager, relayManager *RelayManager, conf
 func (api *APIServer) StartHTTPServer() error {
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("/", api.cors(api.handleRoot))
 	mux.HandleFunc("/health", api.cors(api.handleHealth))
 	mux.HandleFunc("/api/instances", api.cors(api.handleInstances))
 	mux.HandleFunc("/api/chat", api.cors(api.handleChat))
@@ -87,6 +102,42 @@ func (api *APIServer) cors(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// handleRoot handles GET / and returns API summary
+func (api *APIServer) handleRoot(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	response := map[string]interface{}{
+		"service": "voicechat-server",
+		"status":  "ok",
+		"health":  "/health",
+		"apis": []string{
+			"/api/instances",
+			"/api/chat",
+			"/api/stt/stream",
+			"/api/notifications/ws",
+			"/api/notify",
+			"/api/fcm/register",
+			"/api/fcm/push",
+			"/api/conversations",
+			"/api/apk/latest",
+			"/api/apk/download",
+			"/api/apk/upload",
+			"/api/youtube/search",
+		},
+		"timestamp": time.Now().UTC(),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
 // handleHealth handles health check requests
 func (api *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -113,6 +164,18 @@ func (api *APIServer) handleInstances(w http.ResponseWriter, r *http.Request) {
 
 	instances := api.bridgeManager.GetInstances()
 
+	// Add local OpenClaw instance if configured
+	if api.config.LocalOpenclawURL != "" {
+		localInstance := BridgeConnection{
+			ID:          "local",
+			Name:        api.config.LocalOpenclawName,
+			Status:      "online",
+			ConnectedAt: time.Now(),
+		}
+		// Prepend local instance (always first, always online)
+		instances = append([]BridgeConnection{localInstance}, instances...)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(instances)
 }
@@ -132,6 +195,12 @@ func (api *APIServer) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	if err := api.relayManager.ValidateChatRequest(&chatReq); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Local OpenClaw instance — direct HTTP proxy
+	if chatReq.InstanceID == "local" && api.config.LocalOpenclawURL != "" {
+		api.handleLocalChat(w, r, &chatReq)
 		return
 	}
 
@@ -188,6 +257,102 @@ func (api *APIServer) handleChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// handleLocalChat proxies chat to local OpenClaw gateway via OpenAI-compatible API
+func (api *APIServer) handleLocalChat(w http.ResponseWriter, r *http.Request, chatReq *ChatRequest) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	// Build OpenAI-compatible request
+	openaiMessages := make([]map[string]string, len(chatReq.Messages))
+	for i, msg := range chatReq.Messages {
+		openaiMessages[i] = map[string]string{
+			"role":    msg.Role,
+			"content": msg.Content,
+		}
+	}
+
+	body := map[string]interface{}{
+		"model":    "openclaw",
+		"stream":   true,
+		"user":     "voicechat-app",
+		"messages": openaiMessages,
+	}
+	bodyData, _ := json.Marshal(body)
+
+	url := api.config.LocalOpenclawURL + "/v1/chat/completions"
+	httpReq, err := http.NewRequestWithContext(r.Context(), "POST", url, strings.NewReader(string(bodyData)))
+	if err != nil {
+		errorData, _ := json.Marshal(map[string]string{"error": err.Error()})
+		fmt.Fprintf(w, "data: %s\n\n", errorData)
+		flusher.Flush()
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-openclaw-agent-id", "main")
+	if api.config.LocalOpenclawToken != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+api.config.LocalOpenclawToken)
+	}
+
+	client := &http.Client{Timeout: 0} // no timeout for streaming
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		errorData, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("OpenClaw error: %v", err)})
+		fmt.Fprintf(w, "data: %s\n\n", errorData)
+		flusher.Flush()
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		respBody := make([]byte, 1024)
+		n, _ := resp.Body.Read(respBody)
+		errorData, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("OpenClaw HTTP %d: %s", resp.StatusCode, string(respBody[:n]))})
+		fmt.Fprintf(w, "data: %s\n\n", errorData)
+		flusher.Flush()
+		return
+	}
+
+	// Stream SSE from OpenClaw to client, converting format
+	scanner := NewLineScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+
+		var parsed struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(data), &parsed); err != nil {
+			continue
+		}
+		if len(parsed.Choices) > 0 && parsed.Choices[0].Delta.Content != "" {
+			deltaData, _ := json.Marshal(map[string]string{"delta": parsed.Choices[0].Delta.Content})
+			fmt.Fprintf(w, "data: %s\n\n", string(deltaData))
+			flusher.Flush()
+		}
+	}
+
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
+	log.Printf("Local OpenClaw chat completed")
 }
 
 // handleNotify POST /api/notify — Bridge(OpenClaw)가 알림 전송
