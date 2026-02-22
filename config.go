@@ -14,8 +14,11 @@ type Config struct {
 	TLSEnabled       bool   // Enable HTTPS
 	TLSCert          string // Path to TLS certificate
 	TLSKey           string // Path to TLS private key
-	GoogleTTSAPIKey  string // Google Cloud TTS API key
+	GoogleTTSAPIKey   string // Google Cloud TTS API key
 	FcmServiceAccount string // Firebase service account JSON path
+	LocalOpenclawURL  string // Local OpenClaw gateway URL (e.g. http://localhost:18789)
+	LocalOpenclawToken string // Bearer token for local OpenClaw
+	LocalOpenclawName  string // Display name for local instance
 }
 
 // LoadConfig loads configuration from environment variables
@@ -64,6 +67,19 @@ func LoadConfig() *Config {
 
 	if fcmSA := os.Getenv("FCM_SERVICE_ACCOUNT"); fcmSA != "" {
 		config.FcmServiceAccount = fcmSA
+	}
+
+	// Local OpenClaw gateway (runs on same server)
+	if url := os.Getenv("LOCAL_OPENCLAW_URL"); url != "" {
+		config.LocalOpenclawURL = url
+	}
+	if token := os.Getenv("LOCAL_OPENCLAW_TOKEN"); token != "" {
+		config.LocalOpenclawToken = token
+	}
+	if name := os.Getenv("LOCAL_OPENCLAW_NAME"); name != "" {
+		config.LocalOpenclawName = name
+	} else if config.LocalOpenclawURL != "" {
+		config.LocalOpenclawName = "서버 (GCP)"
 	}
 
 	return config

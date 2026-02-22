@@ -76,6 +76,10 @@ func (api *APIServer) StartHTTPServer() error {
 	mux.HandleFunc("/api/apk/download", api.cors(api.apkHandler.HandleDownload))
 	mux.HandleFunc("/api/apk/upload", api.cors(api.apkHandler.HandleUpload))
 	mux.HandleFunc("/api/youtube/search", api.cors(api.handleYouTubeSearch))
+	mux.HandleFunc("/api/youtube/stream", api.cors(api.handleYouTubeStream))
+	mux.HandleFunc("/api/youtube/proxy", api.cors(api.handleYouTubeProxy))
+	mux.HandleFunc("/api/youtube/hls-proxy", api.cors(api.handleYouTubeHLSProxy))
+	mux.HandleFunc("/api/youtube/hls-segment", api.cors(api.handleYouTubeHLSSegment))
 
 	addr := fmt.Sprintf(":%d", api.config.Port)
 
