@@ -32,7 +32,54 @@ var (
 	liveResolving     sync.Map // videoID → *sync.Mutex (prevents concurrent yt-dlp for same video)
 	streamInfoCacheMu sync.Mutex
 	streamInfoCache   = make(map[string]streamInfoEntry)
+
+	// proxySemaphore limits concurrent YouTube audio proxy connections to avoid memory/goroutine buildup.
+	proxySemaphore = make(chan struct{}, 5)
 )
+
+// startCacheGC starts a background goroutine that periodically evicts expired cache entries
+// to prevent unbounded memory growth from stale YouTube stream info and HLS URL entries.
+func startCacheGC() {
+	go func() {
+		ticker := time.NewTicker(30 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			var streamEvicted, hlsEvicted int
+
+			// Evict expired streamInfoCache entries
+			streamInfoCacheMu.Lock()
+			for k, v := range streamInfoCache {
+				if now.After(v.expires) {
+					delete(streamInfoCache, k)
+					streamEvicted++
+				}
+			}
+			streamInfoCacheMu.Unlock()
+
+			// Evict expired liveHLSCache entries
+			liveHLSCacheMu.Lock()
+			for k, v := range liveHLSCache {
+				if now.After(v.expires) {
+					delete(liveHLSCache, k)
+					hlsEvicted++
+				}
+			}
+			liveHLSCacheMu.Unlock()
+
+			// Clear all liveResolving entries (per-video mutexes; safe to reset between GC cycles)
+			var resolvingEvicted int
+			liveResolving.Range(func(k, _ interface{}) bool {
+				liveResolving.Delete(k)
+				resolvingEvicted++
+				return true
+			})
+
+			log.Printf("[CacheGC] Evicted streamInfo=%d, hlsURL=%d, resolving=%d",
+				streamEvicted, hlsEvicted, resolvingEvicted)
+		}
+	}()
+}
 
 func getCachedStreamInfo(videoID string) (*StreamInfo, bool) {
 	streamInfoCacheMu.Lock()
@@ -47,7 +94,7 @@ func getCachedStreamInfo(videoID string) (*StreamInfo, bool) {
 func setCachedStreamInfo(videoID string, info *StreamInfo) {
 	streamInfoCacheMu.Lock()
 	defer streamInfoCacheMu.Unlock()
-	streamInfoCache[videoID] = streamInfoEntry{info: info, expires: time.Now().Add(5 * time.Hour)}
+	streamInfoCache[videoID] = streamInfoEntry{info: info, expires: time.Now().Add(1 * time.Hour)}
 }
 
 func getCachedHLSURL(videoID string) (string, bool) {
@@ -108,7 +155,7 @@ func (api *APIServer) handleYouTubeStream(w http.ResponseWriter, r *http.Request
 
 	// Pre-warm the HLS proxy cache for live streams so the first manifest fetch is fast.
 	if info.IsLive {
-		setCachedHLSURL(videoID, info.AudioURL, 5*time.Hour)
+		setCachedHLSURL(videoID, info.AudioURL, 30*time.Minute)
 		log.Printf("[YouTube] Pre-warmed HLS cache for live stream %s (cached=%v)", videoID, cached)
 	}
 
@@ -125,6 +172,16 @@ func (api *APIServer) handleYouTubeProxy(w http.ResponseWriter, r *http.Request)
 	videoID := r.URL.Query().Get("videoId")
 	if videoID == "" {
 		http.Error(w, "Missing videoId parameter", 400)
+		return
+	}
+
+	// Limit concurrent proxy connections to prevent memory/goroutine accumulation.
+	select {
+	case proxySemaphore <- struct{}{}:
+		defer func() { <-proxySemaphore }()
+	default:
+		log.Printf("[YouTube] Proxy semaphore full, rejecting request for %s", videoID)
+		http.Error(w, "Too many concurrent proxy connections, try again later", 503)
 		return
 	}
 
@@ -207,7 +264,7 @@ func (api *APIServer) handleYouTubeHLSProxy(w http.ResponseWriter, r *http.Reque
 				http.Error(w, fmt.Sprintf("HLS resolve failed: %v", err), 500)
 				return
 			}
-			setCachedHLSURL(videoID, hlsURL, 5*time.Hour)
+			setCachedHLSURL(videoID, hlsURL, 30*time.Minute)
 			log.Printf("[HLSProxy] yt-dlp resolved and cached HLS URL for %s", videoID)
 		} else {
 			log.Printf("[HLSProxy] Using cache after lock for %s", videoID)
@@ -286,9 +343,16 @@ func (api *APIServer) handleYouTubeHLSSegment(w http.ResponseWriter, r *http.Req
 	contentType := resp.Header.Get("Content-Type")
 	isManifest := strings.Contains(contentType, "mpegurl")
 	if isManifest {
-		body, readErr := io.ReadAll(resp.Body)
+		const maxManifestSize = 1 * 1024 * 1024 // 1MB limit for sub-manifests
+		lr := io.LimitReader(resp.Body, maxManifestSize+1)
+		body, readErr := io.ReadAll(lr)
 		if readErr != nil {
 			http.Error(w, "Read failed", 500)
+			return
+		}
+		if len(body) > maxManifestSize {
+			log.Printf("[HLSSegment] Sub-manifest too large (>1MB), rejecting")
+			http.Error(w, "Sub-manifest too large", 500)
 			return
 		}
 		scheme := "https"

@@ -4,11 +4,27 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime/debug"
+	"strconv"
 	"sync"
 	"syscall"
 )
 
 func main() {
+	// Apply memory limit (soft cap to encourage GC before OOM).
+	// Default 600MB; override with MEMORY_LIMIT_MB env var.
+	memLimitMB := 600
+	if v := os.Getenv("MEMORY_LIMIT_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			memLimitMB = n
+		}
+	}
+	debug.SetMemoryLimit(int64(memLimitMB) * 1024 * 1024)
+	log.Printf("Memory soft limit set to %dMB", memLimitMB)
+
+	// Start YouTube cache GC (evicts expired entries every 30 minutes)
+	startCacheGC()
+
 	// Load configuration
 	config := LoadConfig()
 
