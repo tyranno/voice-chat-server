@@ -11,9 +11,10 @@ type Config struct {
 	BridgePort       int    // TCP bridge server port
 	BridgeToken      string // Token for bridge authentication
 	DataDir          string // Directory for persistent data (devices.json etc)
-	TLSEnabled       bool   // Enable HTTPS
-	TLSCert          string // Path to TLS certificate
-	TLSKey           string // Path to TLS private key
+	TLSEnabled          bool   // Enable HTTPS for HTTP API
+	BridgeTLSEnabled    bool   // Enable TLS for Bridge TCP (independent of HTTP API)
+	TLSCert             string // Path to TLS certificate
+	TLSKey              string // Path to TLS private key
 	GoogleTTSAPIKey   string // Google Cloud TTS API key
 	FcmServiceAccount string // Firebase service account JSON path
 	LocalOpenclawURL  string // Local OpenClaw gateway URL (e.g. http://localhost:18789)
@@ -53,6 +54,9 @@ func LoadConfig() *Config {
 	// TLS settings
 	if tlsEnabled := os.Getenv("TLS_ENABLED"); tlsEnabled == "true" || tlsEnabled == "1" {
 		config.TLSEnabled = true
+	}
+	if bridgeTLS := os.Getenv("BRIDGE_TLS_ENABLED"); bridgeTLS == "true" || bridgeTLS == "1" {
+		config.BridgeTLSEnabled = true
 	}
 	if tlsCert := os.Getenv("TLS_CERT"); tlsCert != "" {
 		config.TLSCert = tlsCert

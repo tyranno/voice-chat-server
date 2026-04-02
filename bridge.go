@@ -79,7 +79,7 @@ func (bm *BridgeManager) StartTCPServer() error {
 	var listener net.Listener
 	var err error
 	
-	if bm.config.TLSEnabled && bm.config.TLSCert != "" && bm.config.TLSKey != "" {
+	if (bm.config.BridgeTLSEnabled || bm.config.TLSEnabled) && bm.config.TLSCert != "" && bm.config.TLSKey != "" {
 		// TLS enabled
 		cert, err := tls.LoadX509KeyPair(bm.config.TLSCert, bm.config.TLSKey)
 		if err != nil {
