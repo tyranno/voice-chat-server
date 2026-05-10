@@ -17,6 +17,15 @@ type RequestChannels struct {
 	FileCh     chan FileResponseMessage
 }
 
+// TaskChannels holds per-task channels for Phase 3 Ralph autonomous tasks
+type TaskChannels struct {
+	ProgressCh chan TaskProgressMessage
+	LogCh      chan TaskLogMessage
+	DoneCh     chan TaskDoneMessage
+	ErrorCh    chan TaskErrorMessage
+	FileCh     chan FileResponseMessage
+}
+
 // BridgeConnection represents a connected bridge client
 type BridgeConnection struct {
 	ID          string    `json:"id"`
@@ -27,7 +36,10 @@ type BridgeConnection struct {
 	LastPing    time.Time `json:"-"`
 	// Per-request channel registry (replaces shared channels)
 	requestChans map[string]*RequestChannels `json:"-"`
-	requestMu    sync.RWMutex               `json:"-"`
+	requestMu    sync.RWMutex                `json:"-"`
+	// Per-task channel registry (Phase 3)
+	taskChans map[string]*TaskChannels `json:"-"`
+	taskMu    sync.RWMutex             `json:"-"`
 }
 
 // RegisterRequest creates per-request channels
@@ -55,6 +67,35 @@ func (bc *BridgeConnection) GetRequestChannels(requestID string) *RequestChannel
 	bc.requestMu.RLock()
 	defer bc.requestMu.RUnlock()
 	return bc.requestChans[requestID]
+}
+
+// RegisterTask creates per-task channels (Phase 3)
+func (bc *BridgeConnection) RegisterTask(taskID string) *TaskChannels {
+	ch := &TaskChannels{
+		ProgressCh: make(chan TaskProgressMessage, 100),
+		LogCh:      make(chan TaskLogMessage, 200),
+		DoneCh:     make(chan TaskDoneMessage, 1),
+		ErrorCh:    make(chan TaskErrorMessage, 1),
+		FileCh:     make(chan FileResponseMessage, 10),
+	}
+	bc.taskMu.Lock()
+	bc.taskChans[taskID] = ch
+	bc.taskMu.Unlock()
+	return ch
+}
+
+// UnregisterTask removes per-task channels
+func (bc *BridgeConnection) UnregisterTask(taskID string) {
+	bc.taskMu.Lock()
+	delete(bc.taskChans, taskID)
+	bc.taskMu.Unlock()
+}
+
+// GetTaskChannels returns channels for a specific task
+func (bc *BridgeConnection) GetTaskChannels(taskID string) *TaskChannels {
+	bc.taskMu.RLock()
+	defer bc.taskMu.RUnlock()
+	return bc.taskChans[taskID]
 }
 
 // BridgeManager manages all bridge connections
@@ -153,6 +194,7 @@ func (bm *BridgeManager) handleBridgeConnection(conn net.Conn) {
 		Conn:         conn,
 		LastPing:     time.Now(),
 		requestChans: make(map[string]*RequestChannels),
+		taskChans:    make(map[string]*TaskChannels),
 	}
 
 	// Register the bridge
@@ -229,9 +271,68 @@ func (bm *BridgeManager) bridgeMessageHandler(bridge *BridgeConnection) {
 				log.Printf("Failed to unmarshal file response: %v", err)
 				continue
 			}
+			// Try chat first
 			if ch := bridge.GetRequestChannels(fileMsg.RequestID); ch != nil {
 				select {
 				case ch.FileCh <- fileMsg:
+				default:
+				}
+			} else if tch := bridge.GetTaskChannels(fileMsg.RequestID); tch != nil {
+				// File can also come from a task (RequestID == TaskID)
+				select {
+				case tch.FileCh <- fileMsg:
+				default:
+				}
+			}
+
+		case MsgTypeTaskProgress:
+			var progMsg TaskProgressMessage
+			if err := json.Unmarshal(data, &progMsg); err != nil {
+				log.Printf("Failed to unmarshal task progress: %v", err)
+				continue
+			}
+			if tch := bridge.GetTaskChannels(progMsg.TaskID); tch != nil {
+				select {
+				case tch.ProgressCh <- progMsg:
+				default:
+				}
+			}
+
+		case MsgTypeTaskLog:
+			var logMsg TaskLogMessage
+			if err := json.Unmarshal(data, &logMsg); err != nil {
+				log.Printf("Failed to unmarshal task log: %v", err)
+				continue
+			}
+			if tch := bridge.GetTaskChannels(logMsg.TaskID); tch != nil {
+				select {
+				case tch.LogCh <- logMsg:
+				default:
+				}
+			}
+
+		case MsgTypeTaskDone:
+			var doneMsg TaskDoneMessage
+			if err := json.Unmarshal(data, &doneMsg); err != nil {
+				log.Printf("Failed to unmarshal task done: %v", err)
+				continue
+			}
+			if tch := bridge.GetTaskChannels(doneMsg.TaskID); tch != nil {
+				select {
+				case tch.DoneCh <- doneMsg:
+				default:
+				}
+			}
+
+		case MsgTypeTaskError:
+			var errMsg TaskErrorMessage
+			if err := json.Unmarshal(data, &errMsg); err != nil {
+				log.Printf("Failed to unmarshal task error: %v", err)
+				continue
+			}
+			if tch := bridge.GetTaskChannels(errMsg.TaskID); tch != nil {
+				select {
+				case tch.ErrorCh <- errMsg:
 				default:
 				}
 			}
@@ -290,6 +391,17 @@ func (bm *BridgeManager) removeBridge(id string) {
 			delete(bridge.requestChans, reqID)
 		}
 		bridge.requestMu.Unlock()
+		// Close all per-task channels
+		bridge.taskMu.Lock()
+		for taskID, tch := range bridge.taskChans {
+			close(tch.ProgressCh)
+			close(tch.LogCh)
+			close(tch.DoneCh)
+			close(tch.ErrorCh)
+			close(tch.FileCh)
+			delete(bridge.taskChans, taskID)
+		}
+		bridge.taskMu.Unlock()
 		delete(bm.connections, id)
 	}
 }
@@ -340,6 +452,25 @@ func (bm *BridgeManager) SendChatRequest(bridgeID, requestID string, messages []
 	}
 
 	return SendMessage(bridge.Conn, chatReq)
+}
+
+// SendTaskStart sends a Ralph task start request to a specific bridge
+func (bm *BridgeManager) SendTaskStart(bridgeID string, msg TaskStartMessage) error {
+	bridge := bm.GetBridge(bridgeID)
+	if bridge == nil {
+		return fmt.Errorf("bridge not found: %s", bridgeID)
+	}
+	msg.Type = MsgTypeTaskStart
+	return SendMessage(bridge.Conn, msg)
+}
+
+// SendTaskCancel sends a task cancel request to a specific bridge
+func (bm *BridgeManager) SendTaskCancel(bridgeID, taskID string) error {
+	bridge := bm.GetBridge(bridgeID)
+	if bridge == nil {
+		return fmt.Errorf("bridge not found: %s", bridgeID)
+	}
+	return SendMessage(bridge.Conn, TaskCancelMessage{Type: MsgTypeTaskCancel, TaskID: taskID})
 }
 
 // generateID generates a unique ID for bridge connections

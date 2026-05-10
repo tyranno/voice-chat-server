@@ -65,6 +65,8 @@ func (api *APIServer) StartHTTPServer() error {
 	mux.HandleFunc("/health", api.cors(api.handleHealth))
 	mux.HandleFunc("/api/instances", api.cors(api.handleInstances))
 	mux.HandleFunc("/api/chat", api.cors(api.handleChat))
+	mux.HandleFunc("/api/task", api.cors(api.handleTask))
+	mux.HandleFunc("/api/task/cancel", api.cors(api.handleTaskCancel))
 	mux.HandleFunc("/api/stt/stream", api.sttProxy.Handler())
 	mux.HandleFunc("/api/notifications/ws", api.notifyHub.HandleWebSocket)
 	mux.HandleFunc("/api/notify", api.cors(api.handleNotify))
