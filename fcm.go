@@ -179,16 +179,32 @@ func base64URLEncode(data []byte) string {
 	return strings.TrimRight(base64.URLEncoding.EncodeToString(data), "=")
 }
 
+// removeToken removes an invalid token (called without lock held)
+func (fm *FcmManager) removeToken(instanceID string) {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	delete(fm.tokens, instanceID)
+	fm.saveTokens()
+	log.Printf("[FCM] Token removed for instance: %s (UNREGISTERED)", instanceID)
+}
+
 // SendPush sends a push notification to all registered devices
 func (fm *FcmManager) SendPush(title, message string) error {
 	fm.mu.RLock()
-	defer fm.mu.RUnlock()
+	tokensCopy := make(map[string]string, len(fm.tokens))
+	for k, v := range fm.tokens {
+		tokensCopy[k] = v
+	}
+	fm.mu.RUnlock()
 
 	var lastErr error
-	for instanceID, token := range fm.tokens {
+	for instanceID, token := range tokensCopy {
 		err := fm.sendToToken(token, title, message)
 		if err != nil {
 			log.Printf("[FCM] Send failed for %s: %v", instanceID, err)
+			if isUnregisteredError(err) {
+				fm.removeToken(instanceID)
+			}
 			lastErr = err
 		} else {
 			log.Printf("[FCM] Push sent to %s", instanceID)
@@ -199,13 +215,10 @@ func (fm *FcmManager) SendPush(title, message string) error {
 
 func (fm *FcmManager) SendPushTo(instanceID, title, message string) error {
 	fm.mu.RLock()
-	defer fm.mu.RUnlock()
-
 	token, ok := fm.tokens[instanceID]
 	if !ok {
 		token, ok = fm.tokens["default"]
 		if !ok {
-			// Try first available token
 			for _, t := range fm.tokens {
 				token = t
 				ok = true
@@ -213,10 +226,24 @@ func (fm *FcmManager) SendPushTo(instanceID, title, message string) error {
 			}
 		}
 	}
+	fm.mu.RUnlock()
+
 	if !ok {
 		return fmt.Errorf("no FCM token available")
 	}
-	return fm.sendToToken(token, title, message)
+	err := fm.sendToToken(token, title, message)
+	if err != nil && isUnregisteredError(err) {
+		fm.removeToken(instanceID)
+	}
+	return err
+}
+
+// isUnregisteredError checks if FCM returned UNREGISTERED error
+func isUnregisteredError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "UNREGISTERED")
 }
 
 func (fm *FcmManager) sendToToken(token, title, message string) error {

@@ -118,10 +118,27 @@ func (s *ConversationStore) GetMessages(id string) ([]ConversationMessage, error
 	return s.readMessages(id)
 }
 
+// filterConversationMessages removes messages with empty content
+func filterConversationMessages(msgs []ConversationMessage) []ConversationMessage {
+	filtered := make([]ConversationMessage, 0, len(msgs))
+	for _, m := range msgs {
+		if m.Content != "" {
+			filtered = append(filtered, m)
+		}
+	}
+	return filtered
+}
+
 // AppendMessages adds messages and updates metadata
 func (s *ConversationStore) AppendMessages(id string, msgs []ConversationMessage) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Filter empty content messages before saving
+	msgs = filterConversationMessages(msgs)
+	if len(msgs) == 0 {
+		return nil
+	}
 
 	existing, _ := s.readMessages(id)
 	existing = append(existing, msgs...)

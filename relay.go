@@ -128,20 +128,30 @@ type ChatRequest struct {
 	ConversationID string        `json:"conversationId,omitempty"`
 }
 
+// FilterMessages removes messages with empty content
+func FilterMessages(messages []ChatMessage) []ChatMessage {
+	filtered := make([]ChatMessage, 0, len(messages))
+	for _, msg := range messages {
+		if msg.Content != "" {
+			filtered = append(filtered, msg)
+		}
+	}
+	return filtered
+}
+
 // ValidateChatRequest validates a chat request
 func (rm *RelayManager) ValidateChatRequest(req *ChatRequest) error {
 	if req.InstanceID == "" {
 		return fmt.Errorf("instanceId is required")
 	}
+	// Filter out empty content messages before validation
+	req.Messages = FilterMessages(req.Messages)
 	if len(req.Messages) == 0 {
 		return fmt.Errorf("messages are required")
 	}
 	for i, msg := range req.Messages {
 		if msg.Role == "" {
 			return fmt.Errorf("message[%d]: role is required", i)
-		}
-		if msg.Content == "" {
-			return fmt.Errorf("message[%d]: content is required", i)
 		}
 		if msg.Role != "user" && msg.Role != "assistant" && msg.Role != "system" {
 			return fmt.Errorf("message[%d]: invalid role '%s'", i, msg.Role)

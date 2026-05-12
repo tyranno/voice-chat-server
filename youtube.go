@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -34,7 +35,11 @@ var (
 	streamInfoCache   = make(map[string]streamInfoEntry)
 
 	// proxySemaphore limits concurrent YouTube audio proxy connections to avoid memory/goroutine buildup.
-	proxySemaphore = make(chan struct{}, 5)
+	// 32 slots: client now uses 16-Range parallel download (max throughput for long files), so we need
+	// 16 + 1 streaming + headroom for stale connections (broken-pipe slots take ~2 min to release)
+	// + room for additional users. Previous: 16 was getting saturated when one user downloaded a
+	// long file (4 hours+) at full parallelism.
+	proxySemaphore = make(chan struct{}, 32)
 )
 
 // startCacheGC starts a background goroutine that periodically evicts expired cache entries
@@ -197,17 +202,26 @@ func (api *APIServer) handleYouTubeProxy(w http.ResponseWriter, r *http.Request)
 		}
 		setCachedStreamInfo(videoID, info)
 	}
-	log.Printf("[YouTube] Proxy for %s (cached=%v, isLive=%v)", videoID, cached, info.IsLive)
+	clientRange := r.Header.Get("Range")
+	log.Printf("[YouTube] Proxy for %s (cached=%v, isLive=%v, clientRange=%q)", videoID, cached, info.IsLive, clientRange)
 
 	req, err := http.NewRequest("GET", info.AudioURL, nil)
 	if err != nil {
 		http.Error(w, "Failed to create upstream request", 500)
 		return
 	}
-	if rg := r.Header.Get("Range"); rg != "" {
-		req.Header.Set("Range", rg)
+	// CRITICAL: YouTube CDN throttles plain GET to ~30KB/s.
+	// Always send a Range header upstream — Range requests bypass the throttle
+	// (verified: 31MB/s with Range vs 31KB/s without).
+	// If client sent its own Range (e.g. ExoPlayer), forward it. Otherwise force bytes=0-.
+	if clientRange != "" {
+		req.Header.Set("Range", clientRange)
+	} else {
+		req.Header.Set("Range", "bytes=0-")
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0")
+	// Mobile UA helps with some YouTube CDN routing
+	req.Header.Set("User-Agent",
+		"Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
 
 	client := &http.Client{Timeout: 0}
 	resp, err := client.Do(req)
@@ -223,10 +237,124 @@ func (api *APIServer) handleYouTubeProxy(w http.ResponseWriter, r *http.Request)
 			w.Header().Set(h, v)
 		}
 	}
+	// Always preserve 206 from upstream — keeping Content-Range/Content-Length lets
+	// nginx and the client size buffers correctly. Normalizing to 200 forces chunked
+	// transfer-encoding which serializes badly with proxy_buffering off.
 	w.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.Printf("[YouTube] Proxy copy error for %s: %v", videoID, err)
+	startedAt := time.Now()
+	n, err := io.Copy(w, resp.Body)
+	if err != nil {
+		log.Printf("[YouTube] Proxy copy error for %s after %d bytes: %v", videoID, n, err)
+	} else {
+		elapsed := time.Since(startedAt)
+		speed := float64(n) / elapsed.Seconds()
+		log.Printf("[YouTube] Proxy done for %s: %d bytes in %.2fs (%.0f KB/s, upstream=%d, clientRange=%q)",
+			videoID, n, elapsed.Seconds(), speed/1024, resp.StatusCode, clientRange)
 	}
+}
+
+// handleYouTubeAudio: mp3 transcode endpoint (requires ffmpeg). Not used currently — m4a
+// preference in resolveYouTubeStream gives broad player compatibility without transcoding.
+// Kept for future use if ffmpeg is added.
+//nolint:unused
+func (api *APIServer) handleYouTubeAudio_unused(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+	videoID := r.URL.Query().Get("videoId")
+	if videoID == "" {
+		http.Error(w, "Missing videoId parameter", 400)
+		return
+	}
+
+	// Limit concurrent transcodes (ffmpeg is CPU-heavy)
+	select {
+	case proxySemaphore <- struct{}{}:
+		defer func() { <-proxySemaphore }()
+	default:
+		http.Error(w, "Too many concurrent transcodes, try again later", 503)
+		return
+	}
+
+	// Resolve the source audio URL via cache or yt-dlp
+	info, cached := getCachedStreamInfo(videoID)
+	if !cached {
+		var err error
+		info, err = resolveYouTubeStream(videoID)
+		if err != nil {
+			log.Printf("[Audio] resolve error for %s: %v", videoID, err)
+			http.Error(w, fmt.Sprintf("Stream resolve failed: %v", err), 500)
+			return
+		}
+		setCachedStreamInfo(videoID, info)
+	}
+	if info.IsLive {
+		http.Error(w, "Live streams cannot be downloaded as mp3", 400)
+		return
+	}
+
+	bitrate := r.URL.Query().Get("bitrate")
+	if bitrate == "" {
+		bitrate = "192k"
+	}
+
+	w.Header().Set("Content-Type", "audio/mpeg")
+	w.Header().Set("Cache-Control", "no-cache")
+	// Hint filename for the client
+	safe := sanitizeFilenameStr(info.Title) + ".mp3"
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+safe+"\"")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	// ffmpeg: stream the YouTube audio URL, transcode to mp3, write to stdout.
+	// Range header trick: pass via -headers so ffmpeg's HTTP client sends it upstream,
+	// bypassing YouTube's plain-GET throttle.
+	cmd := exec.Command("ffmpeg",
+		"-headers", "Range: bytes=0-\r\nUser-Agent: Mozilla/5.0\r\n",
+		"-i", info.AudioURL,
+		"-vn",
+		"-c:a", "libmp3lame",
+		"-b:a", bitrate,
+		"-f", "mp3",
+		"-loglevel", "error",
+		"-nostdin",
+		"pipe:1",
+	)
+	cmd.Stdout = w
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+
+	startedAt := time.Now()
+	log.Printf("[Audio] mp3 transcode start for %s (bitrate=%s)", videoID, bitrate)
+	if err := cmd.Run(); err != nil {
+		log.Printf("[Audio] ffmpeg failed for %s: %v stderr=%s", videoID, err, stderr.String())
+		// Headers may already be sent; just log and let client see truncated stream
+		return
+	}
+	log.Printf("[Audio] mp3 transcode done for %s in %.2fs", videoID, time.Since(startedAt).Seconds())
+}
+
+// sanitizeFilenameStr makes a string safe for an HTTP filename header.
+func sanitizeFilenameStr(s string) string {
+	if s == "" {
+		return "track"
+	}
+	out := make([]rune, 0, len(s))
+	for _, r := range s {
+		if r < 32 {
+			continue
+		}
+		switch r {
+		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
+			out = append(out, '_')
+		default:
+			out = append(out, r)
+		}
+	}
+	if len(out) > 100 {
+		out = out[:100]
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // handleYouTubeHLSProxy serves a rewritten HLS manifest that routes all segments through this server.
@@ -536,75 +664,104 @@ func rewriteHLSManifest(manifest, baseURL string) string {
 }
 
 // resolveYouTubeStream uses yt-dlp to extract a direct audio URL for a YouTube video or live stream.
+// Single yt-dlp invocation with combined format fallback chain — yt-dlp itself handles the cascade.
+// Saves 4 process startups vs. previous loop (~1-2s each).
 func resolveYouTubeStream(videoID string) (*StreamInfo, error) {
 	ytURL := fmt.Sprintf("https://www.youtube.com/watch?v=%s", videoID)
 
-	// Live streams need different format codes (91=48kbps HLS, 93=128kbps HLS)
-	// Try bestaudio first; fall back to live-specific formats, then best
-	formats := []string{"bestaudio", "bestaudio/best", "93", "91", "best"}
-	var lastErr error
+	// Prefer m4a (AAC in MP4 container) — universally recognized by Android music players
+	// (Samsung Music, Google Play Music, VLC, etc). webm/opus is YouTube's cheaper alternative
+	// but many stock players can't decode it.
+	// 93/91 are live-stream HLS codes.
+	formatChain := "bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio/bestaudio*/93/91/best"
 
-	for _, format := range formats {
-		cmd := exec.Command("yt-dlp",
-			"--print", "%(url)s\t%(title)s\t%(duration)s\t%(is_live)s",
-			"--format", format,
-			"--no-playlist",
-			"--no-warnings",
-			"--no-check-certificates",
-			"--geo-bypass",
-			"--js-runtimes", "node:/usr/bin/node",
-			ytURL,
-		)
+	cmd := exec.Command("yt-dlp",
+		"--print", "%(url)s\t%(title)s\t%(duration)s\t%(is_live)s",
+		"--format", formatChain,
+		"--no-playlist",
+		"--no-warnings",
+		"--no-check-certificates",
+		"--geo-bypass",
+		"--js-runtimes", "node:/usr/bin/node",
+		ytURL,
+	)
 
-		var stdout, stderr strings.Builder
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
-		if err := cmd.Run(); err != nil {
-			errMsg := strings.TrimSpace(stderr.String())
-			if errMsg == "" {
-				errMsg = err.Error()
-			}
-			lastErr = fmt.Errorf("%s", errMsg)
-			log.Printf("[YouTube] yt-dlp format=%s failed for %s: %s", format, videoID, errMsg)
-			continue
+	if err := cmd.Run(); err != nil {
+		errMsg := strings.TrimSpace(stderr.String())
+		if errMsg == "" {
+			errMsg = err.Error()
 		}
-
-		parts := strings.SplitN(strings.TrimSpace(stdout.String()), "\t", 4)
-		if len(parts) < 1 || parts[0] == "" {
-			lastErr = fmt.Errorf("yt-dlp returned empty output")
-			continue
-		}
-
-		audioURL := parts[0]
-		title := videoID
-		duration := 0
-		isLive := false
-
-		if len(parts) >= 2 && parts[1] != "" {
-			title = parts[1]
-		}
-		if len(parts) >= 3 {
-			fmt.Sscanf(parts[2], "%d", &duration)
-		}
-		if len(parts) >= 4 {
-			isLiveStr := strings.TrimSpace(parts[3])
-			isLive = isLiveStr == "True" || isLiveStr == "true"
-		}
-		// Also detect live by URL pattern (HLS manifest from googlevideo)
-		if strings.Contains(audioURL, "manifest.googlevideo.com") || strings.Contains(audioURL, ".m3u8") {
-			isLive = true
-		}
-
-		preview := audioURL
-		if len(preview) > 60 {
-			preview = preview[:60]
-		}
-		log.Printf("[YouTube] yt-dlp resolved (format=%s, isLive=%v) for %s: %s...", format, isLive, videoID, preview)
-		return &StreamInfo{AudioURL: audioURL, Title: title, Duration: duration, IsLive: isLive}, nil
+		return nil, fmt.Errorf("yt-dlp failed for %s: %s", videoID, errMsg)
 	}
 
-	return nil, fmt.Errorf("yt-dlp failed: %v", lastErr)
+	parts := strings.SplitN(strings.TrimSpace(stdout.String()), "\t", 4)
+	if len(parts) < 1 || parts[0] == "" {
+		return nil, fmt.Errorf("yt-dlp returned empty output for %s", videoID)
+	}
+
+	audioURL := parts[0]
+	title := videoID
+	duration := 0
+	isLive := false
+
+	if len(parts) >= 2 && parts[1] != "" {
+		title = parts[1]
+	}
+	if len(parts) >= 3 {
+		fmt.Sscanf(parts[2], "%d", &duration)
+	}
+	if len(parts) >= 4 {
+		isLiveStr := strings.TrimSpace(parts[3])
+		isLive = isLiveStr == "True" || isLiveStr == "true"
+	}
+	// Also detect live by URL pattern (HLS manifest from googlevideo)
+	if strings.Contains(audioURL, "manifest.googlevideo.com") || strings.Contains(audioURL, ".m3u8") {
+		isLive = true
+	}
+
+	preview := audioURL
+	if len(preview) > 60 {
+		preview = preview[:60]
+	}
+	log.Printf("[YouTube] yt-dlp resolved (isLive=%v) for %s: %s...", isLive, videoID, preview)
+	return &StreamInfo{AudioURL: audioURL, Title: title, Duration: duration, IsLive: isLive}, nil
+}
+
+// prewarmSemaphore limits concurrent background yt-dlp prewarms triggered by search.
+var prewarmSemaphore = make(chan struct{}, 2)
+
+// prewarmTopResults resolves yt-dlp stream info for top N search results in the background
+// so user's first click hits warm cache instead of cold yt-dlp call (10-25s).
+func prewarmTopResults(results []YouTubeResult, n int) {
+	if n > len(results) {
+		n = len(results)
+	}
+	for i := 0; i < n; i++ {
+		videoID := results[i].VideoID
+		// Skip if already cached
+		if _, ok := getCachedStreamInfo(videoID); ok {
+			continue
+		}
+		go func(vid string) {
+			select {
+			case prewarmSemaphore <- struct{}{}:
+				defer func() { <-prewarmSemaphore }()
+			default:
+				return // queue full, skip prewarm for this video
+			}
+			info, err := resolveYouTubeStream(vid)
+			if err != nil {
+				log.Printf("[Prewarm] Failed for %s: %v", vid, err)
+				return
+			}
+			setCachedStreamInfo(vid, info)
+			log.Printf("[Prewarm] Cached %s (isLive=%v)", vid, info.IsLive)
+		}(videoID)
+	}
 }
 
 func (api *APIServer) handleYouTubeSearch(w http.ResponseWriter, r *http.Request) {
@@ -619,38 +776,166 @@ func (api *APIServer) handleYouTubeSearch(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	results, err := searchYouTube(query)
+	// Pagination: offset (default 0) + limit (default 50, max 50).
+	offset := 0
+	limit := 50
+	if v := r.URL.Query().Get("offset"); v != "" {
+		fmt.Sscanf(v, "%d", &offset)
+		if offset < 0 {
+			offset = 0
+		}
+	}
+	if v := r.URL.Query().Get("limit"); v != "" {
+		fmt.Sscanf(v, "%d", &limit)
+		if limit <= 0 || limit > 50 {
+			limit = 50
+		}
+	}
+
+	// For offset > 0, fetch a bigger pool so we have results to page through.
+	// First page (offset=0) returns 50 quickly; later pages need bigger underlying fetch.
+	needed := offset + limit
+	results, err := searchYouTubeWithSize(query, needed)
 	if err != nil {
 		log.Printf("[YouTube] Search error: %v", err)
 		http.Error(w, fmt.Sprintf("Search failed: %v", err), 500)
 		return
 	}
 
+	// Slice for the requested window
+	totalFetched := len(results)
+	if offset >= totalFetched {
+		results = []YouTubeResult{}
+	} else {
+		end := offset + limit
+		if end > totalFetched {
+			end = totalFetched
+		}
+		results = results[offset:end]
+	}
+	log.Printf("[YouTube] Search %q offset=%d limit=%d returned=%d total=%d", query, offset, limit, len(results), totalFetched)
+
+	// Prewarm top 5 results in background so first click hits cache (only on first page)
+	if offset == 0 && len(results) > 0 {
+		go prewarmTopResults(results, 5)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(results)
 }
 
-func searchYouTube(query string) ([]YouTubeResult, error) {
-	searchURL := fmt.Sprintf("https://www.youtube.com/results?search_query=%s", url.QueryEscape(query))
+// Search result cache — same query within 1 hour returns instantly.
+var (
+	searchCacheMu sync.Mutex
+	searchCache   = make(map[string]searchCacheEntry)
+)
 
+type searchCacheEntry struct {
+	results []YouTubeResult
+	expires time.Time
+}
+
+func searchYouTube(query string) ([]YouTubeResult, error) {
+	return searchYouTubeWithSize(query, 50)
+}
+
+// searchYouTubeWithSize fetches up to `size` results. Cache is keyed by query and stores
+// the LARGEST fetch so far — subsequent pages don't re-run yt-dlp if cache already has enough.
+func searchYouTubeWithSize(query string, size int) ([]YouTubeResult, error) {
+	if size <= 0 {
+		size = 50
+	}
+	if size > 300 {
+		size = 300
+	}
+
+	// Cache check — if cached has >= requested size, return slice.
+	searchCacheMu.Lock()
+	if entry, ok := searchCache[query]; ok && time.Now().Before(entry.expires) && len(entry.results) >= size {
+		searchCacheMu.Unlock()
+		return entry.results, nil
+	}
+	searchCacheMu.Unlock()
+
+	// Fetch fresh — yt-dlp ytsearchN: for paginated results.
+	if results, err := searchYouTubeViaYtDlp(query, size); err == nil && len(results) > 0 {
+		searchCacheMu.Lock()
+		// Only overwrite cache if new result set is larger
+		if existing, ok := searchCache[query]; !ok || len(results) > len(existing.results) {
+			searchCache[query] = searchCacheEntry{results: results, expires: time.Now().Add(1 * time.Hour)}
+		}
+		searchCacheMu.Unlock()
+		return results, nil
+	} else {
+		log.Printf("[YouTube] yt-dlp search failed for %q size=%d, falling back to web scrape: %v", query, size, err)
+	}
+
+	// Fallback: web scrape (~20 results, very fast)
+	searchURL := fmt.Sprintf("https://www.youtube.com/results?search_query=%s", url.QueryEscape(query))
 	client := &http.Client{Timeout: 10 * time.Second}
 	req, _ := http.NewRequest("GET", searchURL, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	req.Header.Set("Accept-Language", "ko-KR,ko;q=0.9,en;q=0.8")
-
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch failed: %w", err)
 	}
 	defer resp.Body.Close()
-
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read failed: %w", err)
 	}
+	results, err := parseYouTubeResults(string(body))
+	if err != nil {
+		return nil, err
+	}
+	searchCacheMu.Lock()
+	searchCache[query] = searchCacheEntry{results: results, expires: time.Now().Add(30 * time.Minute)}
+	searchCacheMu.Unlock()
+	return results, nil
+}
 
-	html := string(body)
-	return parseYouTubeResults(html)
+// searchYouTubeViaYtDlp uses yt-dlp's built-in ytsearchN: scheme to fetch up to N results.
+// Output: "videoId\ttitle\n" per line.
+func searchYouTubeViaYtDlp(query string, n int) ([]YouTubeResult, error) {
+	cmd := exec.Command("yt-dlp",
+		fmt.Sprintf("ytsearch%d:%s", n, query),
+		"--print", "%(id)s\t%(title)s",
+		"--no-warnings",
+		"--quiet",
+		"--flat-playlist",
+		"--no-download",
+	)
+	var out, errBuf bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("yt-dlp: %v: %s", err, errBuf.String())
+	}
+	var results []YouTubeResult
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(out.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		vid := strings.TrimSpace(parts[0])
+		title := strings.TrimSpace(parts[1])
+		if len(vid) != 11 || seen[vid] {
+			continue
+		}
+		seen[vid] = true
+		results = append(results, YouTubeResult{
+			VideoID:   vid,
+			Title:     title,
+			Thumbnail: fmt.Sprintf("https://i.ytimg.com/vi/%s/mqdefault.jpg", vid),
+		})
+	}
+	return results, nil
 }
 
 func parseYouTubeResults(html string) ([]YouTubeResult, error) {
