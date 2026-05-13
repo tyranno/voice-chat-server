@@ -1,0 +1,8 @@
+# 로또 6/45 - 매주 일요일 오전 9시 (KST) = UTC 0시
+0 0 * * 0 /home/tyranno/lottery/run_lotto.sh
+# 연금복권 720+ - 매주 금요일 오전 9시 (KST) = UTC 0시
+0 0 * * 5 /home/tyranno/lottery/run_pension.sh
+# 아침 브리핑 - 평일 오전 8시 KST (UTC 23시 전날)
+0 23 * * 0-4 /usr/bin/node /home/tyranno/scripts/morning_briefing.mjs >> /home/tyranno/scripts/logs/morning_briefing.log 2>&1
+# 관심종목 스캔 - 평일 오전 8시 30분 KST (UTC 23시30분 전날)
+30 23 * * 0-4 /usr/bin/node /home/tyranno/scripts/watchlist_scan.mjs >> /home/tyranno/scripts/logs/watchlist.log 2>&1

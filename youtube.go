@@ -519,7 +519,10 @@ func resolveLiveHLSURL(videoID string) (string, error) {
 			"--no-warnings",
 			"--no-check-certificates",
 			"--geo-bypass",
-			"--js-runtimes", "node:/usr/bin/node",
+			// JS runtime: auto-detect from PATH (deno preferred; falls back to node).
+		// Previously hardcoded /usr/bin/node which doesn't exist on NanoPi (only nvm Node 16),
+		// causing yt-dlp to fall back to no-JS extraction → webm/opus instead of m4a.
+		// Auto-detect finds /usr/local/bin/deno on NanoPi and any node/deno on GCP.
 			ytURL,
 		)
 		var stdout, stderr strings.Builder
@@ -682,7 +685,10 @@ func resolveYouTubeStream(videoID string) (*StreamInfo, error) {
 		"--no-warnings",
 		"--no-check-certificates",
 		"--geo-bypass",
-		"--js-runtimes", "node:/usr/bin/node",
+		// JS runtime: auto-detect from PATH (deno preferred; falls back to node).
+		// Previously hardcoded /usr/bin/node which doesn't exist on NanoPi (only nvm Node 16),
+		// causing yt-dlp to fall back to no-JS extraction → webm/opus instead of m4a.
+		// Auto-detect finds /usr/local/bin/deno on NanoPi and any node/deno on GCP.
 		ytURL,
 	)
 

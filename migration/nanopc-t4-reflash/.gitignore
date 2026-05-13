@@ -1,0 +1,11 @@
+# 백업 바이너리 파일들 (PC 로컬에만 보관, git에 커밋 안 함)
+# 비밀정보 포함 + 큰 용량
+*.tar.gz
+*.zip
+*.img
+*.img.gz
+configs/firebase-sa.json
+configs/.env
+configs/*.pem
+configs/*.json.secret
+configs/*-credentials.json

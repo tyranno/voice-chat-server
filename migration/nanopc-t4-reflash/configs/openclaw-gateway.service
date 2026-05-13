@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenClaw Gateway
+After=network.target
+
+[Service]
+Type=simple
+User=tyranno
+ExecStart=/usr/bin/openclaw gateway --bind loopback
+Restart=always
+RestartSec=5
+WorkingDirectory=/home/tyranno
+Environment=HOME=/home/tyranno
+
+[Install]
+WantedBy=multi-user.target

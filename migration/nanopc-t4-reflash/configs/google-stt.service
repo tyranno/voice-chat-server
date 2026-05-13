@@ -1,0 +1,15 @@
+[Unit]
+Description=Google STT WebSocket Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/voicechat
+ExecStart=/opt/voicechat/venv/bin/python3 /opt/voicechat/google_stt_server.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
