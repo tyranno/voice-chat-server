@@ -1,5 +1,8 @@
 # VoiceChat 전체 아키텍처
 
+> 최종 갱신: 2026-05-14
+> GCP → NanoPC-T4 자가호스팅 마이그레이션 완료. 모든 컴포넌트가 NanoPi 한 장비에 통합.
+
 ## 시스템 구성도
 
 ```
@@ -8,216 +11,269 @@
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │              VoiceChat App (Capacitor + SvelteKit)         │  │
 │  │                                                           │  │
-│  │  [마이크] → AudioRecord → OkHttp WebSocket ──────────────────────┐
-│  │  [스피커] ← Android TextToSpeech (on-device TTS) ←── AI 응답    │
-│  │  [UI]    → HTTP POST /api/chat (SSE) ────────────────────────┐  │
-│  └───────────────────────────────────────────────────────────┘  │  │
-└─────────────────────────────────────────────────────────────────┘  │
-                                                                     │
-                          인터넷 (HTTPS/TLS)                         │
-                                                                     │
-┌─────────────────────────────────────────────────────────────────┐  │
-│               GCP VM (34.64.164.13)                              │  │
-│               voicechat.tyranno.xyz                              │  │
-│                                                                  │  │
-│  ┌──────────────────────────────────────────┐                   │  │
-│  │         voice-chat-server (Go)            │                   │  │
-│  │         /opt/voicechat/voicechat-server   │                   │  │
-│  │                                           │                   │  │
-│  │  HTTPS :443 ◄──── 앱 API 요청 ◄──────────────────────────────┘  │
-│  │    ├─ GET  /health                        │                      │
-│  │    ├─ GET  /api/instances                 │                      │
-│  │    ├─ POST /api/chat (SSE) ──► Relay ─────────► ClawBridge      │
-│  │    ├─ POST /api/tts ──► Google Cloud TTS  │                      │
-│  │    ├─ WS   /api/stt/stream ──► :2700 ─┐  │                      │
-│  │    ├─ POST /api/files/upload           │  │                      │
-│  │    ├─ GET  /api/files/:id/:name        │  │                      │
-│  │    ├─ GET  /api/apk/latest             │  │                      │
-│  │    └─ GET  /api/apk/download           │  │                      │
-│  │                                        │  │                      │
-│  │  TLS TCP :9090 ◄── ClawBridge 연결 ◄──────────────────────────┘  │
-│  │    ├─ register (인증)                  │  │                       │
-│  │    ├─ heartbeat (30초)                 │  │                       │
-│  │    ├─ chat_request → Bridge → OpenClaw │  │                       │
-│  │    ├─ chat_response ← Bridge ← OpenClaw│  │                       │
-│  │    └─ file_response ← Bridge           │  │                       │
-│  └──────────────────────────────────────────┘                       │
-│                                            │                         │
-│  ┌──────────────────────────────────────┐  │                         │
-│  │  google_stt_server.py (Python)       │◄─┘                         │
-│  │  WebSocket :2700 (localhost only)    │                             │
-│  │  Google Cloud STT REST API 호출       │                             │
-│  │  VAD (RMS 기반) → 발화 감지 → 전송    │                             │
-│  └──────────────────────────────────────┘                             │
-│                                                                       │
-│  TLS: Let's Encrypt (/etc/letsencrypt/live/voicechat.tyranno.xyz/)   │
-│  Nginx: :80 → proxy_pass :8080 (HTTP 전용, 현재 미사용)              │
-└───────────────────────────────────────────────────────────────────────┘
-
-                          인터넷 (TLS TCP :9090)
-                                  │
-┌─────────────────────────────────────────────────────────────────┐
-│                  윈도우 PC (우리집)                                │
-│                                                                  │
-│  ┌──────────────────────────────────────────┐                   │
-│  │  clawdbot-service.exe (Go)               │                   │
-│  │  Windows 서비스: OpenClawGateway          │                   │
-│  │                                           │                   │
-│  │  ├─ ClawBridge Client ─── TLS ──► :9090  │                   │
-│  │  │   (chat_request 수신 → OpenClaw 전달)  │                   │
-│  │  │   (chat_response 반환 → GCP 서버)      │                   │
-│  │  │                                        │                   │
-│  │  ├─ Gateway 관리 (node 프로세스)           │                   │
-│  │  │   node entry.js gateway → :18789       │                   │
-│  │  │                                        │                   │
-│  │  └─ Power Monitor / Config Watcher        │                   │
-│  └──────────────────────────────────────────┘                   │
-│                          │                                       │
-│                          ▼                                       │
-│  ┌──────────────────────────────────────────┐                   │
-│  │  OpenClaw Gateway (Node.js)              │                   │
-│  │  ws://127.0.0.1:18789                    │                   │
-│  │                                           │                   │
-│  │  ├─ Anthropic Claude (AI 응답 생성)       │                   │
-│  │  ├─ Telegram Bot 연결                     │                   │
-│  │  ├─ WebChat Dashboard                     │                   │
-│  │  ├─ Tool 실행 (exec, web, browser 등)     │                   │
-│  │  └─ Cron / Heartbeat                      │                   │
-│  └──────────────────────────────────────────┘                   │
-└─────────────────────────────────────────────────────────────────┘
+│  │  [마이크] → AudioRecord → OkHttp WebSocket ──────────────────┐
+│  │  [스피커] ← Android TextToSpeech (on-device TTS) ←── AI 응답│ │
+│  │  [UI]    → HTTP POST /api/chat (SSE) ──────────────────┐   │ │
+│  └───────────────────────────────────────────────────────┘ │   │ │
+└────────────────────────────────────────────────────────────┘   │ │
+                                                                  │ │
+                          인터넷 (HTTPS)                          │ │
+                                                                  │ │
+┌─────────────────────────────────────────────────────────────────┴─┴──┐
+│                  Cloudflare Edge (Tunnel)                              │
+│                                                                        │
+│  voicechat.tyranno.xyz ──► Tunnel UUID ──► NanoPi cloudflared        │
+│  openclaw.tyranno.xyz                                                  │
+│  ssh.tyranno.xyz                                                       │
+└────────────────────────────────────────┬───────────────────────────────┘
+                                          │
+                       outbound 영구 연결 (NanoPi → CF 엣지)
+                                          │
+┌─────────────────────────────────────────┴───────────────────────────────┐
+│         NanoPC-T4 (집 LAN 192.168.123.200, Ubuntu 24.04, ARM64)        │
+│                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  cloudflared (systemd: cloudflared.service)                     │    │
+│  │  Tunnel UUID: 6d00f850-6d23-4469-9fbf-c881e8d4c899              │    │
+│  │  config: /etc/cloudflared/config.yml                            │    │
+│  │  ingress:                                                        │    │
+│  │    voicechat.tyranno.xyz → http://localhost:8090                │    │
+│  │    openclaw.tyranno.xyz  → http://localhost:18789               │    │
+│  │    ssh.tyranno.xyz       → ssh://localhost:22                   │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│         │                                  │                            │
+│  ┌──────▼──────────────────────────┐   ┌──▼──────────────────────────┐  │
+│  │  voicechat-server (Go, ARM64)   │   │  openclaw-gateway (Node 22)  │  │
+│  │  /opt/voicechat/voicechat-server│   │  /home/tyranno/.openclaw/    │  │
+│  │  systemd: voicechat.service     │   │  systemd: openclaw-gateway   │  │
+│  │  user: voicechat                │   │  user: tyranno               │  │
+│  │                                 │   │                              │  │
+│  │  HTTP :8090                     │   │  WS :18789 (loopback)        │  │
+│  │   ├─ GET  /health               │   │   ├─ Anthropic Claude        │  │
+│  │   ├─ GET  /api/instances        │   │   ├─ Telegram / WhatsApp 봇  │  │
+│  │   ├─ POST /api/chat (SSE)       │   │   ├─ Tool 실행 (exec/web/...) │  │
+│  │   ├─ POST /api/tts              │   │   ├─ Cron / Heartbeat        │  │
+│  │   ├─ GET  /api/youtube/search   │   │   └─ Plugin runtime          │  │
+│  │   ├─ GET  /api/youtube/proxy    │   └──────────────────────────────┘  │
+│  │   ├─ GET  /api/youtube/stream   │              ▲                      │
+│  │   ├─ POST /api/files/upload     │              │                      │
+│  │   ├─ GET  /api/files/:id/:name  │              │ (oc-proxy 18789→18790)│
+│  │   ├─ GET  /api/apk/latest       │   ┌──────────┴──────────────────┐  │
+│  │   └─ GET  /api/apk/download     │   │  oc-proxy (Python)          │  │
+│  │                                 │   │  systemd: oc-proxy.service  │  │
+│  │  TCP :9090 (BRIDGE_TLS_ENABLED) │   │  /opt/voicechat/oc_proxy.py │  │
+│  │   ├─ ClawBridge instances       │   └─────────────────────────────┘  │
+│  │   ├─ chat_request → Bridge      │                                     │
+│  │   └─ chat_response ← Bridge     │                                     │
+│  └─────────────────────────────────┘                                     │
+│         ▲                                                                │
+│         │ (yt-dlp 호출 - subprocess)                                     │
+│  ┌──────┴──────────────────────────┐                                     │
+│  │  yt-dlp (정적 ARM64 바이너리)    │                                     │
+│  │  /usr/local/bin/yt-dlp          │                                     │
+│  │  + deno (/usr/local/bin/deno) JS 런타임                              │
+│  └─────────────────────────────────┘                                     │
+│                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  추가 도구                                                       │    │
+│  │  - sshd (port 22, fail2ban 보호)                                │    │
+│  │  - cron (lottery, morning_briefing, watchlist_scan)             │    │
+│  │  - ffmpeg, Python 3.12                                          │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## 데이터 흐름
 
 ### 1. 음성인식 (STT) 흐름
+
+현재는 클라이언트 측 Web Speech API 폴백 사용 (서버 측 VOSK 설치 예정):
+
 ```
-S25 마이크 → AudioRecord (16kHz, 16-bit, mono)
-  → NativeSttPlugin.java (OkHttp WebSocket)
-  → wss://voicechat.tyranno.xyz/api/stt/stream
-  → voice-chat-server stt.go (WebSocket proxy)
-  → ws://127.0.0.1:2700 (google_stt_server.py)
-  → VAD (RMS 기반 발화 감지)
-  → Google Cloud STT REST API (speech:recognize)
-  → 인식 결과 JSON 반환
-  → 앱 UI에 텍스트 표시
+S25 마이크 → Web Speech API (브라우저 또는 SvelteKit WebView)
+  → 인식 결과 텍스트 → 앱 UI
 ```
+
+서버 측 STT 옵션 (필요 시 활성화):
+- VOSK (오프라인, `pip install vosk`, 한국어 모델 ~50MB)
+- Google Cloud STT (`/opt/voicechat/google_stt_server.py`, API 키 필요)
 
 ### 2. AI 대화 (Chat) 흐름
+
 ```
 앱 → POST https://voicechat.tyranno.xyz/api/chat
-  { instanceId: "bridge_xxx", messages: [...] }
-  → voice-chat-server relay.go
-  → TCP 메시지 → ClawBridge (PC)
-  → clawdbot-service bridge.go
-  → POST http://localhost:18789/v1/chat/completions (SSE)
-  → OpenClaw Gateway → Anthropic Claude
+  { instanceId: "...", messages: [...] }
+  → Cloudflare Tunnel → NanoPi:cloudflared → http://localhost:8090
+  → voicechat-server relay.go
+  → TCP :9090 → ClawBridge (loopback)
+  → openclaw-gateway :18789
+  → Anthropic Claude API
   ← SSE delta 스트리밍
-  ← TCP chat_response (delta)
-  ← SSE data: {"delta": "..."} → 앱
+  ← 응답 → 앱
 ```
 
-### 3. TTS (음성합성) 흐름
+### 3. 음악 재생 흐름
+
 ```
-방법 A: On-device (현재 기본)
-  AI 응답 텍스트 → Android TextToSpeech
-  → USAGE_ASSISTANCE_NAVIGATION_GUIDANCE (Samsung DND 우회)
-  → 스피커 출력
+앱 → GET /api/youtube/proxy?videoId=X (Cloudflare Tunnel)
+  → voicechat-server youtube.go
+  → yt-dlp subprocess (deno JS 런타임 사용 → m4a 추출)
+  → googlevideo.com (NanoPi 주거용 IP → 봇 차단 없음)
+  ← audioUrl 스트리밍 ← Range 응답
+  → ExoPlayer (앱 Android) → 재생
+```
+
+### 4. TTS (음성합성) 흐름
+
+```
+방법 A: On-device (기본)
+  AI 응답 텍스트 → Android TextToSpeech → 스피커
 
 방법 B: Cloud TTS (서버 API)
-  POST https://voicechat.tyranno.xyz/api/tts
-  → Google Cloud TTS API (ko-KR-Neural2-A)
-  → MP3 바이너리 반환 → 앱에서 재생
+  POST /api/tts → Google Cloud TTS → MP3 → 앱 재생
 ```
 
 ## 컴포넌트 상세
 
-### voice-chat-server (GCP)
+### voice-chat-server (NanoPi, Go ARM64)
+
 | 항목 | 값 |
-|------|-----|
-| 경로 | `/opt/voicechat/voicechat-server` |
-| 소스 | `E:\Project\My\voice-chat-server` |
-| 서비스 | `systemctl status voicechat-server` |
-| HTTPS 포트 | 443 (TLS, Let's Encrypt) |
+|---|---|
+| 바이너리 | `/opt/voicechat/voicechat-server` (ARM64) |
+| 소스 | `C:\Project\88.MyProject\voice-chat-server` |
+| 빌드 | `build-linux.bat` (GOOS=linux GOARCH=arm64) |
+| 서비스 | `sudo systemctl status voicechat` |
+| HTTP 포트 | 8090 (loopback) |
 | Bridge 포트 | 9090 (TLS TCP) |
-| 데이터 | `/opt/voicechat/data/` |
-| TLS 인증서 | `/etc/letsencrypt/live/voicechat.tyranno.xyz/` |
+| 데이터 | `/opt/voicechat/data/` + `/data/` (SD 마운트) |
+| 실행 사용자 | `voicechat` |
 
-### google_stt_server.py (GCP)
-| 항목 | 값 |
-|------|-----|
-| 경로 | `/opt/voicechat/google_stt_server.py` |
-| 서비스 | `systemctl status google-stt` |
-| 포트 | 2700 (localhost WebSocket) |
-| VAD | RMS threshold=800, silence=0.5s, min speech=0.3s |
-| 최대 오디오 | 15초 |
-| API | Google Cloud STT REST (`speech:recognize`) |
+### cloudflared (NanoPi)
 
-### clawdbot-service (Windows PC)
 | 항목 | 값 |
-|------|-----|
-| 소스 | `E:\Project\My\clawdbot-service` |
-| 서비스 | Windows 서비스 `OpenClawGateway` (자동 시작) |
-| 설정 | `~/.openclaw/service-config.txt` |
-| 로그 | `~/.openclaw/logs/service.log` |
-| 기능 | Gateway 관리, ClawBridge, Power Monitor, Config Watch |
+|---|---|
+| 바이너리 | `/usr/local/bin/cloudflared` (ARM64) |
+| 서비스 | `sudo systemctl status cloudflared` |
+| 시스템 config | `/etc/cloudflared/config.yml` |
+| Tunnel UUID | `6d00f850-6d23-4469-9fbf-c881e8d4c899` |
+| 자격증명 | `/home/tyranno/.cloudflared/<UUID>.json` |
+
+### openclaw-gateway (NanoPi, Node 22)
+
+| 항목 | 값 |
+|---|---|
+| 설치 | `npm install -g openclaw` (Node ≥22.14 필요) |
+| 설정 | `/home/tyranno/.openclaw/openclaw.json` |
+| 서비스 | `sudo systemctl status openclaw-gateway` |
+| 포트 | 18789 (loopback) |
+| 외부 접근 | `https://openclaw.tyranno.xyz` (Cloudflare Tunnel) |
+| 실행 사용자 | `tyranno` |
+
+### oc-proxy (NanoPi, Python)
+
+| 항목 | 값 |
+|---|---|
+| 소스 | `/opt/voicechat/oc_proxy.py` |
+| 서비스 | `sudo systemctl status oc-proxy` |
+| 포트 | 18790 |
+| 역할 | 18789 → 18790 프록시 (CORS / origin 헤더 처리) |
 
 ### VoiceChat App (Android)
+
 | 항목 | 값 |
-|------|-----|
-| 소스 | `E:\Project\My\voice-chat` |
-| 프레임워크 | Capacitor + SvelteKit |
-| 테스트 기기 | Samsung Galaxy S25 (R3CY10AF61Z) |
-| STT | NativeSttPlugin (OkHttp WebSocket) |
+|---|---|
+| 소스 | `C:\Project\88.MyProject\voice-chat` |
+| 프레임워크 | Capacitor 6 + SvelteKit 5 + Tailwind 4 |
+| 테스트 기기 | Samsung Galaxy S25 |
+| STT | Web Speech API (현재) / NativeSttPlugin (옵션) |
 | TTS | Android TextToSpeech (on-device) |
 | API 서버 | `https://voicechat.tyranno.xyz` |
 
 ## 서버 접속 정보
 
-### GCP VM
+### SSH (회사 PC / 외부)
+
 ```bash
-ssh -i ~/.ssh/voicechat-key tyranno@34.64.164.13
-# 또는
-ssh -i ~/.ssh/voicechat-key tyranno@voicechat.tyranno.xyz
+ssh nanopi
+# ~/.ssh/config 에 정의됨:
+#   HostName ssh.tyranno.xyz
+#   User tyranno
+#   ProxyCommand cloudflared access ssh --hostname ssh.tyranno.xyz
+# 키 인증 (id_rsa) — 비번 불필요
 ```
 
-### 서비스 관리
-```bash
-# GCP
-sudo systemctl restart voicechat-server
-sudo systemctl restart google-stt
-sudo systemctl status voicechat-server google-stt
+### SSH (집 LAN)
 
-# Windows (PowerShell 관리자)
-Start-Service OpenClawGateway
-Stop-Service OpenClawGateway
-Get-Service OpenClawGateway
+```bash
+ssh nanopi-lan
+# HostName 192.168.123.200, User tyranno
+```
+
+### 서비스 관리 (NanoPi에서)
+
+```bash
+sudo systemctl status voicechat cloudflared openclaw-gateway oc-proxy
+sudo systemctl restart voicechat
+sudo journalctl -u voicechat -f
+sudo journalctl -u cloudflared -f
+
+# fail2ban 차단 확인
+sudo fail2ban-client status sshd
 ```
 
 ## 배포
 
 ### 서버 배포 (voice-chat-server)
-```bat
-# 로컬에서 빌드
-E:\Project\My\voice-chat-server\build-linux.bat
 
-# GCP에 업로드 + 재시작
-E:\Project\My\voice-chat-server\deploy.bat
+```bash
+# 로컬 (회사/집 PC)에서:
+cd C:\Project\88.MyProject\voice-chat-server
+deploy.bat                 # ARM64 빌드 → nanopi에 SCP → 재시작
+# 또는 LAN 직접:
+deploy.bat nanopi-lan
 ```
 
-### 앱 빌드 (voice-chat)
-```bat
-cd E:\Project\My\voice-chat
+### APK 배포
+
+```bash
+# server 측 스크립트
+upload-apk.bat 0.10.27
+
+# 또는 app 측 PowerShell (빌드부터)
+cd C:\Project\88.MyProject\voice-chat
+.\deploy-apk.ps1 -Version "0.10.27"
+```
+
+### 앱 빌드 (수동)
+
+```bash
+cd C:\Project\88.MyProject\voice-chat
 npm run build          # SvelteKit 빌드
 npx cap sync android   # Capacitor 동기화
 cd android
 .\gradlew assembleDebug
-# APK: android/app/build/outputs/apk/debug/app-debug.apk
+# 출력: android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
 ## 보안
 
+- **SSH**: 키 인증만 (비번 보조), fail2ban (3회 실패 24시간 차단, LAN 제외)
+- **Cloudflare Tunnel**: outbound 연결만, 포트 개방 불필요, 집 IP 비공개
 - **Bridge 인증**: BRIDGE_TOKEN으로 TCP 연결 시 인증
-- **TLS**: HTTPS(:443) + Bridge TCP(:9090) 모두 Let's Encrypt 인증서
-- **STT 서버**: localhost:2700 바인딩 (외부 접근 불가)
-- **OpenClaw**: localhost:18789 바인딩 (외부 접근 불가)
-- **API 키**: Google Cloud STT/TTS API 키 사용 (환경변수)
+- **TLS**: Cloudflare가 자동 처리 (Tunnel + Edge TLS)
+- **Bridge TCP**: `BRIDGE_TLS_ENABLED=true` 시 자체 TLS
+- **OpenClaw**: loopback 18789 (외부는 Cloudflare Tunnel + openclaw.tyranno.xyz 경유)
+- **API 키**: Google Cloud TTS, Anthropic 등 `/opt/voicechat/.env`에 저장 (600 권한)
+
+## 백업 / 복구
+
+GCP 백업: `C:\Users\lab\Downloads\gcp-backup\` (42MB tarball + NanoPi 추가 백업)
+
+재플래시 / 재해 복구 절차: [`migration/nanopc-t4-reflash/README.md`](migration/nanopc-t4-reflash/README.md)
+
+## 관련 저장소
+
+- `voice-chat` — 앱 (Capacitor + SvelteKit, Android)
+- `voice-chat-server` — 이 저장소 (Go server)
+- `clawdbot-service` — 별도 (이전 GCP 시절 윈도우 PC 측 Bridge 클라이언트, **현재 미사용**)
+- OpenClaw — 외부 npm 패키지

@@ -3,7 +3,9 @@ package main
 import (
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -159,12 +161,13 @@ func (bm *BridgeManager) StartTCPServer() error {
 func (bm *BridgeManager) handleBridgeConnection(conn net.Conn) {
 	defer conn.Close()
 
-	log.Printf("New bridge connection from %s", conn.RemoteAddr())
-
-	// Wait for register message
+	// Wait for register message. Probes/port-scans connect without sending data,
+	// producing EOF — silent for those, log only real protocol errors.
 	data, err := ReadMessage(conn)
 	if err != nil {
-		log.Printf("Failed to read register message: %v", err)
+		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			log.Printf("Failed to read register message from %s: %v", conn.RemoteAddr(), err)
+		}
 		return
 	}
 

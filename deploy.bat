@@ -1,34 +1,34 @@
 @echo off
-REM Build + Deploy to Ubuntu VM via SCP
-REM Usage: deploy.bat [user@host] [ssh-key] [domain]
+REM Build + Deploy to NanoPC-T4 (ARM64) — current production server
+REM Usage: deploy.bat [ssh-host]
+REM   ssh-host: SSH config alias or user@host (default: nanopi)
+REM
+REM Examples:
+REM   deploy.bat             — uses 'nanopi' from ~/.ssh/config (Cloudflare Tunnel)
+REM   deploy.bat nanopi-lan  — uses LAN IP 192.168.123.200
+REM   deploy.bat user@host   — custom host
 
 set HOST=%~1
-set KEY=%~2
-set DOMAIN=%~3
+if "%HOST%"=="" set HOST=nanopi
 
-if "%HOST%"=="" (
-    echo Usage: deploy.bat user@host [ssh-key-path] [domain]
-    echo Example: deploy.bat tyranno@34.64.164.13 C:\Users\tyranno\.ssh\voicechat-key voicechat.tyranno.xyz
+echo === Building ARM64 Linux binary ===
+call build-linux.bat
+if %ERRORLEVEL% NEQ 0 (
+    echo Build failed
     exit /b 1
 )
 
-echo === Building Linux binary ===
-call build-linux.bat
-if %ERRORLEVEL% NEQ 0 exit /b 1
-
 echo === Uploading to %HOST% ===
-if "%KEY%"=="" (
-    scp voicechat-server deploy\voicechat.service deploy\.env.example deploy\setup.sh %HOST%:/tmp/
-) else (
-    scp -i %KEY% voicechat-server deploy\voicechat.service deploy\.env.example deploy\setup.sh %HOST%:/tmp/
+scp voicechat-server-linux-arm64 %HOST%:/tmp/voicechat-server-new
+if %ERRORLEVEL% NEQ 0 (
+    echo SCP failed — check SSH access: ssh %HOST% 'echo ok'
+    exit /b 1
 )
 
+echo === Deploying on %HOST% ===
+REM 기존 binary 소유자를 자동 검출해 그대로 유지 (서비스 user가 환경마다 다를 수 있음)
+ssh %HOST% "OWNER=$(stat -c %%U:%%G /opt/voicechat/voicechat-server) && sudo systemctl stop voicechat && sudo cp /tmp/voicechat-server-new /opt/voicechat/voicechat-server && sudo chmod +x /opt/voicechat/voicechat-server && sudo chown $OWNER /opt/voicechat/voicechat-server && sudo systemctl start voicechat && sleep 2 && sudo systemctl is-active voicechat && curl -s http://localhost:8090/health"
+
+echo.
 echo === Done ===
-echo On the server run:
-if "%DOMAIN%"=="" (
-    echo   cd /tmp ^&^& sudo bash setup.sh
-) else (
-    echo   cd /tmp ^&^& sudo bash setup.sh %DOMAIN%
-)
-echo   sudo nano /opt/voicechat/.env
-echo   sudo systemctl start voicechat
+echo Verify external: curl https://voicechat.tyranno.xyz/health
