@@ -244,7 +244,12 @@ func (api *APIServer) handleYouTubeProxy(w http.ResponseWriter, r *http.Request)
 	startedAt := time.Now()
 	n, err := io.Copy(w, resp.Body)
 	if err != nil {
-		log.Printf("[YouTube] Proxy copy error for %s after %d bytes: %v", videoID, n, err)
+		msg := err.Error()
+		if strings.Contains(msg, "broken pipe") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "write: closed") {
+			// client disconnected mid-stream — normal for range requests / buffered players
+		} else {
+			log.Printf("[YouTube] Proxy copy error for %s after %d bytes: %v", videoID, n, err)
+		}
 	} else {
 		elapsed := time.Since(startedAt)
 		speed := float64(n) / elapsed.Seconds()
