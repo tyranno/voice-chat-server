@@ -49,7 +49,7 @@ func NewAPIServer(bridgeManager *BridgeManager, relayManager *RelayManager, conf
 		bridgeManager:     bridgeManager,
 		relayManager:      relayManager,
 		config:            config,
-		sttProxy:          NewSTTProxy("ws://127.0.0.1:2700"),
+		sttProxy:          newSTTProxyIfEnabled(),
 		notifyHub:         NewNotificationHub(),
 		fcmManager:        fcmMgr,
 		conversationStore: NewConversationStore(config.DataDir),
@@ -67,7 +67,9 @@ func (api *APIServer) StartHTTPServer() error {
 	mux.HandleFunc("/api/chat", api.cors(api.handleChat))
 	mux.HandleFunc("/api/task", api.cors(api.handleTask))
 	mux.HandleFunc("/api/task/cancel", api.cors(api.handleTaskCancel))
-	mux.HandleFunc("/api/stt/stream", api.sttProxy.Handler())
+	if api.sttProxy != nil {
+		mux.HandleFunc("/api/stt/stream", api.sttProxy.Handler())
+	}
 	mux.HandleFunc("/api/notifications/ws", api.notifyHub.HandleWebSocket)
 	mux.HandleFunc("/api/notify", api.cors(api.handleNotify))
 	mux.HandleFunc("/api/fcm/register", api.cors(api.fcmManager.HandleRegister))

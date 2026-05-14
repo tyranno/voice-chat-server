@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -14,6 +15,14 @@ import (
 type STTProxy struct {
 	voskURL  string
 	upgrader websocket.Upgrader
+}
+
+func newSTTProxyIfEnabled() *STTProxy {
+	if os.Getenv("GOOGLE_STT_API_KEY") == "" {
+		log.Println("[STT] disabled (GOOGLE_STT_API_KEY not set)")
+		return nil
+	}
+	return NewSTTProxy("ws://127.0.0.1:2700")
 }
 
 func NewSTTProxy(voskURL string) *STTProxy {
