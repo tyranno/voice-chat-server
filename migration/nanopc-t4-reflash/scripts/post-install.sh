@@ -14,7 +14,7 @@ set -euo pipefail
 
 BACKUP_DIR="${HOME}/gcp-backup"
 SERVICE_USER="voicechat"
-PASSWORD="1234"  # NanoPi tyranno user password (sudo)
+# 이 스크립트는 인터랙티브 sudo로 실행 — 평문 password 변수 불필요 (제거됨)
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 err() { echo "[ERR] $*" >&2; exit 1; }
@@ -151,16 +151,45 @@ else
 fi
 
 # ============================================================
+log "[13/13] Google STT + oc-proxy 보조 서비스"
+# ============================================================
+# Python venv 생성 (외부 패키지 설치는 PEP 668에 따라 venv 필요)
+if [ ! -d /opt/voicechat/venv ]; then
+  sudo python3 -m venv /opt/voicechat/venv
+  sudo chown -R "$SERVICE_USER:$SERVICE_USER" /opt/voicechat/venv 2>/dev/null || \
+    sudo chown -R tyranno:tyranno /opt/voicechat/venv
+fi
+sudo /opt/voicechat/venv/bin/pip install --quiet --upgrade pip
+sudo /opt/voicechat/venv/bin/pip install --quiet websockets requests numpy
+
+# google_stt_server.py + google-stt.service 배치
+CONF_DIR="$(dirname "$(readlink -f "$0")")/../configs"
+[ -f "$CONF_DIR/google_stt_server.py" ] && sudo cp "$CONF_DIR/google_stt_server.py" /opt/voicechat/
+[ -f "$CONF_DIR/oc_proxy.py" ] && sudo cp "$CONF_DIR/oc_proxy.py" /opt/voicechat/
+[ -f "$CONF_DIR/google-stt.service" ] && sudo cp "$CONF_DIR/google-stt.service" /etc/systemd/system/
+[ -f "$CONF_DIR/oc-proxy.service" ] && sudo cp "$CONF_DIR/oc-proxy.service" /etc/systemd/system/
+
+# google_stt_server.py는 .env의 GOOGLE_STT_API_KEY를 읽음 (systemd unit에 EnvironmentFile=/opt/voicechat/.env)
+# .env에 GOOGLE_STT_API_KEY=... 가 있는지 확인
+if ! sudo grep -q "^GOOGLE_STT_API_KEY=" /opt/voicechat/.env 2>/dev/null; then
+  log "  WARN: .env에 GOOGLE_STT_API_KEY 누락 — 추가 필요 (Google Cloud Console에서 발급)"
+fi
+
+sudo systemctl daemon-reload
+sudo systemctl enable google-stt oc-proxy 2>&1 | tail -2
+log "  - google-stt (포트 2700) + oc-proxy (포트 18790) 등록"
+
+# ============================================================
 log "=== 설치 완료 ==="
 log ""
 log "서비스 시작:"
-log "  sudo systemctl start voicechat cloudflared"
-log "  sudo systemctl start openclaw-gateway   # 있으면"
+log "  sudo systemctl start voicechat cloudflared openclaw-gateway"
+log "  sudo systemctl start google-stt oc-proxy   # 음성/채팅 보조"
 log ""
 log "검증:"
 log "  curl http://localhost:8090/health"
 log "  curl https://voicechat.tyranno.xyz/health   # 외부에서"
+log "  ss -tlnp | grep -E '2700|18790|8090|9090'   # 포트 확인"
 log ""
 log "로그 확인:"
-log "  journalctl -u voicechat -f"
-log "  journalctl -u cloudflared -f"
+log "  journalctl -u voicechat -u google-stt -u oc-proxy -u openclaw-gateway -f"

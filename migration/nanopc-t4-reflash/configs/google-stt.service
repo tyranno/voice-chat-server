@@ -6,10 +6,11 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/voicechat
+EnvironmentFile=/opt/voicechat/.env
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/voicechat/venv/bin/python3 /opt/voicechat/google_stt_server.py
 Restart=always
 RestartSec=5
-Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
