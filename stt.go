@@ -35,7 +35,21 @@ func NewSTTProxy(voskURL string) *STTProxy {
 	}
 }
 
-func (p *STTProxy) Handler() http.HandlerFunc { return p.handleWS }
+func (p *STTProxy) Handler() http.HandlerFunc {
+	if p == nil {
+		// STT disabled — accept WebSocket then send error so client falls back gracefully
+		upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+		return func(w http.ResponseWriter, r *http.Request) {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","text":"STT 비활성화됨"}`))
+			conn.Close()
+		}
+	}
+	return p.handleWS
+}
 
 func (p *STTProxy) handleWS(w http.ResponseWriter, r *http.Request) {
 	clientConn, err := p.upgrader.Upgrade(w, r, nil)
