@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -41,6 +42,28 @@ var (
 	// long file (4 hours+) at full parallelism.
 	proxySemaphore = make(chan struct{}, 32)
 )
+
+// ytdlpTmpDir is where PyInstaller-packaged yt-dlp extracts its bundled Python runtime.
+// Default /tmp fills the small root partition (13GB overlay on NanoPi) after many runs.
+// /data is the SD-card mount with ample space.
+const ytdlpTmpDir = "/data"
+
+// ytdlpCmd creates an exec.Command for yt-dlp with TMPDIR forced to the SD-card mount
+// so PyInstaller's _MEI* extraction dirs don't fill the root partition.
+func ytdlpCmd(args ...string) *exec.Cmd {
+	cmd := exec.Command("yt-dlp", args...)
+	// Inherit all env vars, then override TMPDIR only.
+	env := os.Environ()
+	updated := make([]string, 0, len(env))
+	for _, e := range env {
+		if !strings.HasPrefix(e, "TMPDIR=") && !strings.HasPrefix(e, "TEMP=") && !strings.HasPrefix(e, "TMP=") {
+			updated = append(updated, e)
+		}
+	}
+	updated = append(updated, "TMPDIR="+ytdlpTmpDir)
+	cmd.Env = updated
+	return cmd
+}
 
 // startCacheGC starts a background goroutine that periodically evicts expired cache entries
 // to prevent unbounded memory growth from stale YouTube stream info and HLS URL entries.
@@ -205,7 +228,11 @@ func (api *APIServer) handleYouTubeProxy(w http.ResponseWriter, r *http.Request)
 	clientRange := r.Header.Get("Range")
 	log.Printf("[YouTube] Proxy for %s (cached=%v, isLive=%v, clientRange=%q)", videoID, cached, info.IsLive, clientRange)
 
-	req, err := http.NewRequest("GET", info.AudioURL, nil)
+	// Use r.Context() so the upstream YouTube CDN connection is cancelled immediately
+	// when the Android client disconnects (e.g. user switches to a different track).
+	// Without this, abandoned goroutines keep holding semaphore slots for up to 2 minutes,
+	// potentially exhausting the pool and causing 503 for subsequent play requests.
+	req, err := http.NewRequestWithContext(r.Context(), "GET", info.AudioURL, nil)
 	if err != nil {
 		http.Error(w, "Failed to create upstream request", 500)
 		return
@@ -245,8 +272,9 @@ func (api *APIServer) handleYouTubeProxy(w http.ResponseWriter, r *http.Request)
 	n, err := io.Copy(w, resp.Body)
 	if err != nil {
 		msg := err.Error()
-		if strings.Contains(msg, "broken pipe") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "write: closed") {
-			// client disconnected mid-stream — normal for range requests / buffered players
+		if strings.Contains(msg, "broken pipe") || strings.Contains(msg, "connection reset") ||
+			strings.Contains(msg, "write: closed") || strings.Contains(msg, "context canceled") {
+			// client disconnected (or switched tracks) — normal, semaphore slot released immediately
 		} else {
 			log.Printf("[YouTube] Proxy copy error for %s after %d bytes: %v", videoID, n, err)
 		}
@@ -448,7 +476,7 @@ func (api *APIServer) handleYouTubeHLSSegment(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	req, err := http.NewRequest("GET", segURL, nil)
+	req, err := http.NewRequestWithContext(r.Context(), "GET", segURL, nil)
 	if err != nil {
 		http.Error(w, "Invalid segment URL", 400)
 		return
@@ -517,17 +545,13 @@ func resolveLiveHLSURL(videoID string) (string, error) {
 	var lastErr error
 
 	for _, format := range formats {
-		cmd := exec.Command("yt-dlp",
+		cmd := ytdlpCmd(
 			"--print", "%(url)s",
 			"--format", format,
 			"--no-playlist",
 			"--no-warnings",
 			"--no-check-certificates",
 			"--geo-bypass",
-			// JS runtime: auto-detect from PATH (deno preferred; falls back to node).
-		// Previously hardcoded /usr/bin/node which doesn't exist on NanoPi (only nvm Node 16),
-		// causing yt-dlp to fall back to no-JS extraction → webm/opus instead of m4a.
-		// Auto-detect finds /usr/local/bin/deno on NanoPi and any node/deno on GCP.
 			ytURL,
 		)
 		var stdout, stderr strings.Builder
@@ -683,17 +707,13 @@ func resolveYouTubeStream(videoID string) (*StreamInfo, error) {
 	// 93/91 are live-stream HLS codes.
 	formatChain := "bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio/bestaudio*/93/91/best"
 
-	cmd := exec.Command("yt-dlp",
+	cmd := ytdlpCmd(
 		"--print", "%(url)s\t%(title)s\t%(duration)s\t%(is_live)s",
 		"--format", formatChain,
 		"--no-playlist",
 		"--no-warnings",
 		"--no-check-certificates",
 		"--geo-bypass",
-		// JS runtime: auto-detect from PATH (deno preferred; falls back to node).
-		// Previously hardcoded /usr/bin/node which doesn't exist on NanoPi (only nvm Node 16),
-		// causing yt-dlp to fall back to no-JS extraction → webm/opus instead of m4a.
-		// Auto-detect finds /usr/local/bin/deno on NanoPi and any node/deno on GCP.
 		ytURL,
 	)
 
@@ -909,7 +929,7 @@ func searchYouTubeWithSize(query string, size int) ([]YouTubeResult, error) {
 // searchYouTubeViaYtDlp uses yt-dlp's built-in ytsearchN: scheme to fetch up to N results.
 // Output: "videoId\ttitle\n" per line.
 func searchYouTubeViaYtDlp(query string, n int) ([]YouTubeResult, error) {
-	cmd := exec.Command("yt-dlp",
+	cmd := ytdlpCmd(
 		fmt.Sprintf("ytsearch%d:%s", n, query),
 		"--print", "%(id)s\t%(title)s",
 		"--no-warnings",
