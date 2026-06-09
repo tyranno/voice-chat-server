@@ -148,6 +148,7 @@ type YouTubeResult struct {
 	VideoID   string `json:"videoId"`
 	Title     string `json:"title"`
 	Thumbnail string `json:"thumbnail"`
+	Duration  int    `json:"duration"` // seconds, 0 if unknown
 }
 
 type StreamInfo struct {
@@ -927,11 +928,11 @@ func searchYouTubeWithSize(query string, size int) ([]YouTubeResult, error) {
 }
 
 // searchYouTubeViaYtDlp uses yt-dlp's built-in ytsearchN: scheme to fetch up to N results.
-// Output: "videoId\ttitle\n" per line.
+// Output: "videoId\ttitle\tduration\n" per line.
 func searchYouTubeViaYtDlp(query string, n int) ([]YouTubeResult, error) {
 	cmd := ytdlpCmd(
 		fmt.Sprintf("ytsearch%d:%s", n, query),
-		"--print", "%(id)s\t%(title)s",
+		"--print", "%(id)s\t%(title)s\t%(duration)s",
 		"--no-warnings",
 		"--quiet",
 		"--flat-playlist",
@@ -950,8 +951,8 @@ func searchYouTubeViaYtDlp(query string, n int) ([]YouTubeResult, error) {
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) != 2 {
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) < 2 {
 			continue
 		}
 		vid := strings.TrimSpace(parts[0])
@@ -959,11 +960,16 @@ func searchYouTubeViaYtDlp(query string, n int) ([]YouTubeResult, error) {
 		if len(vid) != 11 || seen[vid] {
 			continue
 		}
+		dur := 0
+		if len(parts) == 3 {
+			fmt.Sscanf(strings.TrimSpace(parts[2]), "%d", &dur)
+		}
 		seen[vid] = true
 		results = append(results, YouTubeResult{
 			VideoID:   vid,
 			Title:     title,
 			Thumbnail: fmt.Sprintf("https://i.ytimg.com/vi/%s/mqdefault.jpg", vid),
+			Duration:  dur,
 		})
 	}
 	return results, nil
